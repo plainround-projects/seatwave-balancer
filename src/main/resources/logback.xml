@@ -1,0 +1,17 @@
+<configuration>
+  <!-- One line per lifecycle event and per warning, with the request's correlation id when there is
+       one. Holds are logged at DEBUG: at 1,000 holds per second per instance an INFO line each
+       would cost more than the hold. -->
+  <!-- Log lines go to standard error, so a tool's report on standard output stays clean. -->
+  <appender name="console" class="ch.qos.logback.core.ConsoleAppender">
+    <target>System.err</target>
+    <encoder>
+      <pattern>%d{HH:mm:ss.SSS} %-5level [%X{correlationId:-none}] %logger{0} - %msg%n</pattern>
+    </encoder>
+  </appender>
+  <!-- HikariCP's own INFO lines (pool start and stop) are kept; its DEBUG chatter is not. -->
+  <logger name="com.zaxxer.hikari" level="INFO"/>
+  <root level="INFO">
+    <appender-ref ref="console"/>
+  </root>
+</configuration>

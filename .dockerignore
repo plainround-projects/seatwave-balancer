@@ -1,0 +1,5 @@
+# The image needs only the collected jars and the settings; everything else stays out of the
+# build context, above all build/secrets, whose database password must never enter an image.
+*
+!build/stack/lib/
+!config/

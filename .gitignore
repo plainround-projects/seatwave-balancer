@@ -1,0 +1,10 @@
+.gradle/
+build/
+out/
+*.log
+.DS_Store
+.idea/
+*.iml
+.env
+# The lab's database password is generated into build/secrets on every machine and never committed.
+*.password

@@ -1,0 +1,213 @@
+# SeatWave on three stateless instances behind a redundant pair of load balancers (Module 10).
+# Start and stop it with scripts/stack.sh, which uses the project name seatwave-balancer and brings
+# everything down with "down -v".
+# Images are pinned by tag and digest, checked on Docker Hub on 11 November 2026, each with an
+# arm64 variant: haproxy:3.4.7 (the 3.4 long-term-support line, Debian trixie) and postgres:18.6
+# (Debian trixie), both Docker Official Images; SeatWave's image and the keepalived image are built
+# here from pinned official images (Dockerfile, keepalived/Dockerfile).
+# Ports are published on 127.0.0.1 only, from Module 10's range 21000 to 21099, and only the
+# balancers' ports: no SeatWave instance and not the database can be reached from outside the lab
+# network. Nothing runs privileged, nothing uses the host network or the Docker socket, and the only
+# folders mounted are this project's own, read-only.
+name: seatwave-balancer
+
+x-haproxy-image: &haproxy-image haproxy:3.4.7@sha256:f6d2ee87b47192d9cc8c22e88fef405122ff339859644883edc2a7d1827f87b3
+
+x-hardening: &hardening
+  security_opt:
+    - no-new-privileges:true
+  read_only: true
+
+x-seatwave: &seatwave
+  <<: *hardening
+  image: seatwave-balancer-seatwave:1.0.0
+  cap_drop:
+    - ALL
+  # Two CPUs and 512 MB each: three instances, two balancers, the database and the harness share
+  # the Docker virtual machine's 12 CPUs (Section 8 of the module).
+  cpus: 2
+  mem_limit: 512m
+  tmpfs:
+    - /tmp
+  secrets:
+    - db_password
+  depends_on:
+    postgres:
+      condition: service_healthy
+  # Longer than drain.deadlineMillis (20 s): docker stop sends SIGTERM, waits this long, then
+  # SIGKILL, so a draining instance is never killed by docker.
+  stop_grace_period: 30s
+
+x-balancer: &balancer
+  <<: *hardening
+  image: *haproxy-image
+  cap_drop:
+    - ALL
+  # One CPU each, and nbthread 1 in haproxy.cfg: every balancer number is per core.
+  cpus: 1
+  mem_limit: 256m
+  tmpfs:
+    - /tmp
+  volumes:
+    - ./haproxy/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+
+x-keepalived: &keepalived
+  <<: *hardening
+  build: ./keepalived
+  image: seatwave-balancer-keepalived:1.0.0
+  # NET_ADMIN adds and removes the floating address; NET_RAW sends VRRP; SETUID and SETGID let it
+  # run its check script as the script user. Nothing else.
+  cap_drop:
+    - ALL
+  cap_add:
+    - NET_ADMIN
+    - NET_RAW
+    - SETUID
+    - SETGID
+  cpus: 0.25
+  mem_limit: 64m
+  tmpfs:
+    - /run
+    - /tmp
+
+services:
+  postgres:
+    <<: *hardening
+    image: postgres:18.6@sha256:e3d24f6906d0760bf4da0dae872415391ededefad23fd471c47dc53b0ddf3c42
+    environment:
+      POSTGRES_USER: seatwave
+      POSTGRES_DB: seatwave
+      # The password is a file generated at run time into build/secrets (scripts/stack.sh).
+      POSTGRES_PASSWORD_FILE: /run/secrets/db_password
+    secrets:
+      - db_password
+    # The entrypoint starts as root to own the data folder, then runs PostgreSQL as its own user.
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
+      - SETGID
+      - SETUID
+    cpus: 2
+    mem_limit: 1g
+    shm_size: 128m
+    tmpfs:
+      - /var/run/postgresql
+      - /tmp
+    volumes:
+      - pgdata:/var/lib/postgresql
+      # Runs once, when the data volume is new: the tables and Module 1's 20,000 seats.
+      - ./db/schema.sql:/docker-entrypoint-initdb.d/schema.sql:ro
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "seatwave", "-d", "seatwave"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+    networks:
+      lab:
+        ipv4_address: 10.210.10.5
+
+  seatwave-1:
+    <<: *seatwave
+    build: .
+    command: ["io.plainround.seatwave.balancer.seatwave.SeatWaveCli", "/app/config/seatwave-container.properties", "seatwave-1"]
+    networks:
+      lab:
+        ipv4_address: 10.210.10.11
+
+  seatwave-2:
+    <<: *seatwave
+    command: ["io.plainround.seatwave.balancer.seatwave.SeatWaveCli", "/app/config/seatwave-container.properties", "seatwave-2"]
+    networks:
+      lab:
+        ipv4_address: 10.210.10.12
+
+  seatwave-3:
+    <<: *seatwave
+    command: ["io.plainround.seatwave.balancer.seatwave.SeatWaveCli", "/app/config/seatwave-container.properties", "seatwave-3"]
+    networks:
+      lab:
+        ipv4_address: 10.210.10.13
+
+  lb1:
+    <<: *balancer
+    environment:
+      BALANCER_NAME: lb1
+    networks:
+      lab:
+        ipv4_address: 10.210.10.21
+    ports:
+      - "127.0.0.1:21000:8080"
+      - "127.0.0.1:21001:8081"
+      - "127.0.0.1:21002:8082"
+      - "127.0.0.1:21003:8083"
+      - "127.0.0.1:21004:8404"
+      - "127.0.0.1:21005:9999"
+
+  lb2:
+    <<: *balancer
+    environment:
+      BALANCER_NAME: lb2
+    networks:
+      lab:
+        ipv4_address: 10.210.10.22
+    ports:
+      - "127.0.0.1:21010:8080"
+      - "127.0.0.1:21011:8081"
+      - "127.0.0.1:21012:8082"
+      - "127.0.0.1:21013:8083"
+      - "127.0.0.1:21014:8404"
+      - "127.0.0.1:21015:9999"
+
+  # Each keepalived shares its balancer's network namespace, as a second process on the same
+  # machine would: the floating address lands on the balancer's own interface, and when the
+  # balancer's container dies, its keepalived loses the network with it.
+  keepalived-1:
+    <<: *keepalived
+    network_mode: "service:lb1"
+    depends_on:
+      - lb1
+    volumes:
+      - ./keepalived/lb1.conf:/etc/keepalived/keepalived.conf:ro
+
+  keepalived-2:
+    <<: *keepalived
+    network_mode: "service:lb2"
+    depends_on:
+      - lb2
+    volumes:
+      - ./keepalived/lb2.conf:/etc/keepalived/keepalived.conf:ro
+
+  # The harness, inside the lab network: the floating address exists only there, and timings
+  # taken here do not cross Docker Desktop's port forwarder. Started only on demand
+  # (docker compose run --rm harness <settings>); it publishes no port.
+  harness:
+    <<: *hardening
+    image: seatwave-balancer-seatwave:1.0.0
+    profiles:
+      - tools
+    entrypoint: ["/opt/seatwave-java/bin/java", "-cp", "/app/lib/*", "io.plainround.seatwave.balancer.harness.HarnessCli"]
+    cap_drop:
+      - ALL
+    cpus: 2
+    mem_limit: 1g
+    tmpfs:
+      - /tmp
+    networks:
+      lab:
+        ipv4_address: 10.210.10.30
+
+secrets:
+  db_password:
+    file: ./build/secrets/db.password
+
+volumes:
+  pgdata:
+
+networks:
+  lab:
+    ipam:
+      config:
+        - subnet: 10.210.10.0/24
