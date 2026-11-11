@@ -10,7 +10,7 @@ These five files are the part of an instance that talks HTTP.
 - `Request.java`: one request as the routes see it, copied out of the web server's own objects.
 - `Problems.java`: builds the one error shape of SeatWave, a JSON body called "problem details".
 - `SeatWaveServer.java`: the web server. It opens two ports, runs requests on a fixed pool of threads, asks `Lifecycle` for permission before it reads a request, and drains on stop.
-- `HoldRoutes.java`: the two routes, `POST /v1/holds` and `GET /v1/holds/{holdId}`, and every rule that turns a request into a reply.
+- `HoldRoutes.java`: the two routes, `POST /v1/holds` and `GET /v1/holds/{holdId}` (which also answers `HEAD`), and every rule that turns a request into a reply.
 
 Terms you need.
 
@@ -381,7 +381,12 @@ public final class SeatWaveServer {
   private static final int UNAVAILABLE = 503;
   // 0: the in-flight wait is the Lifecycle's job, done before the listeners are stopped.
   private static final int STOP_DELAY_SECONDS = 0;
-  private static final long WORKER_STOP_SECONDS = 5;
+  // After the drain, the longest wait for worker threads to end: a request past the drain
+  // deadline gets this long, then is interrupted. The worst-case stop is therefore the drain
+  // deadline plus this wait (ServiceSettingsTest checks compose.yaml's grace period covers it).
+  static final Duration WORKER_STOP_WAIT = Duration.ofSeconds(5);
+  // HEAD is answered like GET without a body (RFC 9110, Section 9.3.2); -1 tells the JDK server so.
+  private static final long NO_BODY = -1;
 
   private final HttpServer requests;
   private final HttpServer admin;
@@ -392,19 +397,26 @@ public final class SeatWaveServer {
   private final HoldRoutes routes;
   private final HoldStore store;
   private final String instanceName;
+  private final Duration workerStopWait;
 ```
 
 - `LOG` is this class's logger.
 - `OK`, `NOT_FOUND`, `UNAVAILABLE` are named status numbers. A name beats a bare 503.
 - `STOP_DELAY_SECONDS = 0`. The comment explains: the JDK server's `stop(delay)` waits up to `delay` seconds for running requests. The code already waited in the lifecycle, before it closes anything, so it asks for no further wait.
-- `WORKER_STOP_SECONDS = 5` is how long the pool gets to end its threads.
-- The fields: the two servers, the admin thread, the worker pool, one `Lifecycle`, the `ServiceMetrics` that watches the lifecycle, the routes, the store, and the instance's name (`seatwave-1`).
+- `WORKER_STOP_WAIT = Duration.ofSeconds(5)` is how long the worker pool gets to end its threads after the drain. A `Duration` is an amount of time (see `java.md`), so the value carries its unit with it. The comment explains what it means for a slow request: a request still running when the drain deadline passes gets these five seconds more, and is then interrupted. So the longest possible stop is the drain deadline plus this wait: 20 seconds (`drain.deadlineMillis=20000`) plus 5, 25 seconds, inside the 30 seconds `stop_grace_period` that `compose.yaml` gives Docker before it kills the process. The constant has no `private`, so it is **package-private**: any class in the same package can read it, a test included. `ServiceSettingsTest.givesDockerStopMoreTimeThanTheWorstCaseShutdown` reads it, adds it to the shipped drain deadline and checks that the grace period in `compose.yaml` is longer. (The comment names `InfrastructureRulesTest` for that check; the test that really does it is the `ServiceSettingsTest` one.)
+- `NO_BODY = -1`. A `HEAD` request asks for the headers a `GET` would get, without the body (RFC 9110, Section 9.3.2). The JDK server's `sendResponseHeaders(status, length)` reads a length of -1 as "there is no body". The name says what -1 means at the place it is used.
+- The fields: the two servers, the admin thread, the worker pool, one `Lifecycle`, the `ServiceMetrics` that watches the lifecycle, the routes, the store, the instance's name (`seatwave-1`), and `workerStopWait`, the wait this server uses after a drain.
 
 ```java
   private SeatWaveServer(
-      ServiceSettings settings, String instanceName, HoldStore store, Clock clock)
+      ServiceSettings settings,
+      String instanceName,
+      HoldStore store,
+      Clock clock,
+      Duration workerStopWait)
       throws IOException {
     this.instanceName = instanceName;
+    this.workerStopWait = workerStopWait;
     this.store = store;
     this.routes = new HoldRoutes(store, new JsonCodec(), clock);
     AtomicInteger workerNumber = new AtomicInteger();
@@ -424,7 +436,7 @@ public final class SeatWaveServer {
             });
 ```
 
-The constructor is private: callers use `start`.
+The constructor is private: callers use `start`. Its five parameters are written one per line only because they do not fit on one; `this.workerStopWait = workerStopWait` keeps the wait the caller chose.
 
 - `this.routes = new HoldRoutes(store, new JsonCodec(), clock)` builds the routes with the store and a JSON codec.
 - `AtomicInteger workerNumber` hands out numbers 1, 2, 3 for thread names.
@@ -480,11 +492,40 @@ The constructor is private: callers use `start`.
     Objects.requireNonNull(instanceName, "instanceName");
     Objects.requireNonNull(store, "store");
     Objects.requireNonNull(clock, "clock");
-    return new SeatWaveServer(settings, instanceName, store, clock);
+    return new SeatWaveServer(settings, instanceName, store, clock, WORKER_STOP_WAIT);
+  }
+
+  /**
+   * Opens both listeners with another wait for the workers after the drain, so a test of the
+   * deadline does not wait the full {@link #WORKER_STOP_WAIT}.
+   *
+   * @param settings the checked settings
+   * @param instanceName the instance's name
+   * @param store the shared hold store
+   * @param clock the clock holds expire by
+   * @param workerStopWait the longest wait for worker threads after the drain
+   * @return the running server
+   * @throws IOException if a port cannot be bound
+   */
+  static SeatWaveServer start(
+      ServiceSettings settings,
+      String instanceName,
+      HoldStore store,
+      Clock clock,
+      Duration workerStopWait)
+      throws IOException {
+    Objects.requireNonNull(settings, "settings");
+    Objects.requireNonNull(instanceName, "instanceName");
+    Objects.requireNonNull(store, "store");
+    Objects.requireNonNull(clock, "clock");
+    Objects.requireNonNull(workerStopWait, "workerStopWait");
+    return new SeatWaveServer(settings, instanceName, store, clock, workerStopWait);
   }
 ```
 
-`start` is the public way in. It refuses a null for each argument, then builds the server. The Javadoc states the starting state: the instance is in `STARTING` and refuses every request until `markReady` is called.
+`start` is the public way in. It refuses a null for each argument, then builds the server with the real wait, `WORKER_STOP_WAIT`. The Javadoc states the starting state: the instance is in `STARTING` and refuses every request until `markReady` is called.
+
+The second `start` has the same name and one more parameter, `Duration workerStopWait`. Two methods with one name and different parameters are an **overload**: Java picks the one whose parameters fit the call. This one has no `public`, so only classes of this package can call it. Its Javadoc gives the reason: a test of the drain deadline would otherwise wait the full five seconds. `SeatWaveServerTest` passes 100 ms. It also refuses a null wait.
 
 ```java
   /**
@@ -524,7 +565,7 @@ The constructor is private: callers use `start`.
     adminThread.shutdownNow();
     workers.shutdown();
     try {
-      if (!workers.awaitTermination(WORKER_STOP_SECONDS, TimeUnit.SECONDS)) {
+      if (!workers.awaitTermination(workerStopWait.toNanos(), TimeUnit.NANOSECONDS)) {
         workers.shutdownNow();
       }
     } catch (InterruptedException interrupted) {
@@ -539,7 +580,7 @@ The constructor is private: callers use `start`.
 
 1. `lifecycle.startDraining()` closes the gate: from now on every request is refused. The log line says how many are in flight.
 2. `lifecycle.awaitDrained(deadline)` waits for the in-flight count to reach zero or for the deadline. If the waiting thread is interrupted, the code sets the thread's interrupt flag again (`Thread.currentThread().interrupt()`, so the caller can still see it) and builds a result from what it knows.
-3. Only now do the ports close: `requests.stop(0)` and `admin.stop(0)`, then `adminThread.shutdownNow()`. Then `workers.shutdown()` stops accepting jobs and lets running ones end, and `awaitTermination(5, SECONDS)` waits for the threads. If they do not end in 5 seconds, `shutdownNow()` interrupts them.
+3. Only now do the ports close: `requests.stop(0)` and `admin.stop(0)`, then `adminThread.shutdownNow()`. Then `workers.shutdown()` stops accepting jobs and lets running ones end, and `awaitTermination(workerStopWait.toNanos(), TimeUnit.NANOSECONDS)` waits for the threads. `toNanos()` turns the `Duration` into a whole number of nanoseconds, and `TimeUnit.NANOSECONDS` tells `awaitTermination` which unit that number is in; nanoseconds keep a 100 ms test wait exact. If the threads do not end in time (5 seconds in a real instance), `shutdownNow()` interrupts them.
 4. The result is returned, so `SeatWaveCli` can print it.
 
 "Safe to call more than once", says the Javadoc: the lifecycle calls tolerate repetition, and the tests call it in `@AfterEach` even after a test already called it.
@@ -634,7 +675,8 @@ When the admission is present:
   private void handleAdmin(HttpExchange exchange) throws IOException {
     try (exchange) {
       String path = exchange.getRequestURI().getRawPath();
-      boolean isGet = exchange.getRequestMethod().equals("GET");
+      String method = exchange.getRequestMethod();
+      boolean isGet = method.equals("GET") || method.equals("HEAD");
       Reply reply;
       if (isGet && path.equals("/health")) {
         // Liveness: the process answers. Never asks the database, because restarting an instance
@@ -650,7 +692,8 @@ When the admission is present:
                 metrics.render().getBytes(StandardCharsets.UTF_8),
                 List.of());
       } else {
-        reply = Reply.json(NOT_FOUND, "{\"detail\":\"only GET /health, /ready and /metrics\"}");
+        reply =
+            Reply.json(NOT_FOUND, "{\"detail\":\"only GET or HEAD /health, /ready and /metrics\"}");
       }
       write(exchange, reply.withHeader("Cache-Control", "no-store"));
     }
@@ -659,11 +702,11 @@ When the admission is present:
 
 `handleAdmin` serves the second port. It never touches the lifecycle's gate: the checks must answer in every state.
 
-- `getRequestURI().getRawPath()` is the path as sent; `getRequestMethod().equals("GET")` checks the method.
+- `getRequestURI().getRawPath()` is the path as sent. `method` is the request's method, and `isGet` is true for `GET` or `HEAD`. `||` means "or". A `HEAD` request asks for exactly the headers a `GET` would get, without the body, so the same three checks answer it; `write` leaves the body out.
 - `GET /health`: `200` with `{"status":"up",...}`. The comment says why it never asks the database: restarting an instance does not repair a database that is down, so the liveness answer must not depend on it.
 - `GET /ready`: calls `readiness()`.
 - `GET /metrics`: the Prometheus text from `ServiceMetrics.render()`, with the media type `text/plain; version=0.0.4; charset=utf-8` that Prometheus expects.
-- Anything else, including `HEAD` and `POST`: `404` with a small JSON detail. A `HEAD /health` therefore answers `404`, which a reader should know when probing by hand.
+- Anything else, a `POST` for example: `404` with a small JSON detail, `only GET or HEAD /health, /ready and /metrics`. The statement is split over two lines only to stay short.
 - Every admin reply gets `Cache-Control: no-store`, so no cache keeps a stale health answer.
 
 ```java
@@ -724,15 +767,16 @@ When the admission is present:
 
 ```java
   private static void drainBody(HttpExchange exchange) throws IOException {
-    // The request body is read and thrown away, so the 503 is not written while the client is
-    // still sending, which some clients report as a reset instead of a response.
+    // The request body is read and thrown away, up to one byte over the limit, so the 503 is not
+    // written while the client is still sending, which some clients report as a reset instead of
+    // a response. readNBytes reads until it has them or the body ends; a skip may stop short.
     try (InputStream in = exchange.getRequestBody()) {
-      in.skip(HoldRoutes.MAX_BODY_BYTES + 1L);
+      in.readNBytes(HoldRoutes.MAX_BODY_BYTES + 1);
     }
   }
 ```
 
-`drainBody` reads up to 1,025 bytes of the body and drops them (`skip`). The comment gives the reason: if the server writes the `503` while the client is still sending, some clients report a connection reset and never read the `503`. One caution for a careful reader: `InputStream.skip` may skip fewer bytes than asked, and the code does not check how many it skipped, so a large body can still be partly unread. The JDK server drains a limited amount more when it closes the exchange, and closes the connection otherwise.
+`drainBody` reads up to 1,025 bytes of the body, one byte over the limit, and drops them: the array that `readNBytes` returns is never stored. The comment gives the reason: if the server writes the `503` while the client is still sending, some clients report a connection reset and never read the `503`. The last sentence of the comment says why it is `readNBytes` and not `skip`: `readNBytes(n)` keeps reading until it has `n` bytes or the body ends, while `InputStream.skip(n)` may stop after fewer bytes and say so only in its return value. Version 1.0.0 used `skip` and did not look at that value.
 
 ```java
   private void write(HttpExchange exchange, Reply reply) throws IOException {
@@ -744,6 +788,10 @@ When the admission is present:
     // why a public balancer would remove it before the response leaves.
     exchange.getResponseHeaders().set("X-Served-By", instanceName);
     byte[] body = reply.body();
+    if (exchange.getRequestMethod().equals("HEAD")) {
+      exchange.sendResponseHeaders(reply.status(), NO_BODY);
+      return;
+    }
     exchange.sendResponseHeaders(reply.status(), body.length);
     try (OutputStream out = exchange.getResponseBody()) {
       out.write(body);
@@ -756,7 +804,8 @@ When the admission is present:
 
 - `getResponseHeaders().set("Content-Type", ...)` sets the type. Each reply header is added with `add`.
 - `X-Served-By` is set to the instance name on every reply. The lab counts traffic share from it. The comment points to Section 10 of the module, which says a public balancer would remove it.
-- `sendResponseHeaders(status, body.length)` writes the status line and headers. The second argument is the exact body length; it must be right. A length of zero would mean "chunked", and -1 "no body", neither of which occurs here because every reply has a body.
+- For a `HEAD` request, `sendResponseHeaders(reply.status(), NO_BODY)` writes the status line and the headers with the length -1, which tells the JDK server there is no body, and `return` leaves the method before any body is written. The reply was built exactly as for a `GET`, so the status and the headers are the same. Version 1.0.0 had no such branch: the JDK server then logged a warning about a content length for a `HEAD` request.
+- For every other method, `sendResponseHeaders(status, body.length)` writes the status line and headers. The second argument is the exact body length; it must be right. A length of zero would mean "chunked" (the body is sent in pieces whose total is not known in advance).
 - The body is written in a try-with-resources block, so the stream closes and the reply is complete.
 
 A detail visible on the wire: the JDK server rewrites header names so only the first letter is a capital. `X-Served-By` appears as `X-served-by` in the output of `curl`. HTTP says header names ignore case, so clients must not care.
@@ -857,9 +906,10 @@ The constructor stores the store, the codec and the clock, and builds a `Problem
     }
     Matcher holdPath = HOLD_PATH.matcher(path);
     if (holdPath.matches()) {
-      return request.method().equals("GET")
+      // HEAD is GET without a body (RFC 9110); the server leaves the body out when it writes.
+      return request.method().equals("GET") || request.method().equals("HEAD")
           ? new Routed("GET /v1/holds/{holdId}", readHold(request, holdPath.group(1)))
-          : new Routed("other", notAllowed(request, "GET"));
+          : new Routed("other", notAllowed(request, "GET, HEAD"));
     }
     return new Routed("other", notFound(request));
   }
@@ -868,7 +918,7 @@ The constructor stores the store, the codec and the clock, and builds a `Problem
 `route` is the traffic officer.
 
 - The path `/v1/holds` with method `POST` goes to `hold`; with any other method it is `405` with `Allow: POST`.
-- A path that matches `HOLD_PATH` with method `GET` goes to `readHold`, passing the captured id (`holdPath.group(1)`); with any other method it is `405` with `Allow: GET`.
+- A path that matches `HOLD_PATH` with method `GET` or `HEAD` goes to `readHold`, passing the captured id (`holdPath.group(1)`); with any other method it is `405` with `Allow: GET, HEAD`. The comment gives the reason for `HEAD`: RFC 9110 defines it as `GET` without a body, so the route builds the same reply, and the server's `write` leaves the body out. Both methods count under the one template `GET /v1/holds/{holdId}`. `HoldRoutesTest.readsAHoldWithHeadAsWithGet` and `HoldRoutesTest.answersMethodNotAllowedWithTheAllowedMethod` (which expects `Allow` to be `GET, HEAD`) test it.
 - Everything else is `404`.
 - The first value of each `Routed` is the **route template**: `POST /v1/holds`, `GET /v1/holds/{holdId}` or `other`. The metrics use the template, never the raw path, so there is a handful of labels and not one per hold id.
 
@@ -906,7 +956,7 @@ The constructor stores the store, the codec and the clock, and builds a `Problem
       return problems.of(
           TOO_LARGE,
           "body-too-large",
-          "The body is over 1,024 bytes",
+          "The body is too large",
           "send at most " + MAX_BODY_BYTES + " bytes",
           request.correlationId());
     }
@@ -928,19 +978,25 @@ The constructor stores the store, the codec and the clock, and builds a `Problem
           checked(request, parsed);
       case Result.Error<HoldRequestBody, JsonCodec.BindingProblem>(
               JsonCodec.BindingProblem problem) ->
-          invalid(request, List.of(problem.pointer() + " " + problem.detail()));
+          // A whole-body problem has the empty pointer (RFC 6901), so its detail stands alone.
+          invalid(
+              request,
+              List.of(
+                  problem.pointer().isEmpty()
+                      ? problem.detail()
+                      : problem.pointer() + " " + problem.detail()));
     };
   }
 ```
 
 `hold` handles `POST /v1/holds`. It checks in a fixed order, and the first failure answers.
 
-1. **Too large**: `413`, if the server saw more than 1,024 bytes.
+1. **Too large**: `413` with the title `The body is too large`, if the server saw more than 1,024 bytes. The title is a short name of the problem kind (RFC 9457 says a title should not change from one occurrence to the next), and the number lives in the detail, `send at most 1024 bytes`, which is built from `MAX_BODY_BYTES`. So the limit is written in one place only.
 2. **Media type**: `415` unless `isJson(contentType)`.
 3. **Idempotency-Key**: `400` unless the header matches `HoldCommand.IDEMPOTENCY_KEY`. The same pattern the command uses.
 4. **The body**: bytes to text, then `json.read(body, HoldRequestBody.class)` in a `switch` over the `Result`.
    - `case Result.Success<...>(HoldRequestBody parsed) -> checked(request, parsed)`: a **record pattern**. It both tests that the result is a success and takes its value out into the variable `parsed`.
-   - `case Result.Error<...>(JsonCodec.BindingProblem problem)`: `400` with the sentence `pointer + " " + detail`, for example `/x is not a field of this request`.
+   - `case Result.Error<...>(JsonCodec.BindingProblem problem)`: `400` with one sentence. When the problem is about one field, the pointer names it and the sentence is `pointer + " " + detail`, for example `/x is not a field of this request`. When it is about the whole body, the pointer is the empty text (RFC 6901: the empty pointer is the whole document), so the detail stands alone: `the body has data after the JSON object`, not the same with a space in front. `problem.pointer().isEmpty() ? ... : ...` makes that choice; `?` and `:` form a conditional expression, a small `if` that gives a value. `HoldRoutesTest.startsAWholeBodyProblemWithTheReasonNotASpace` tests it, and `HoldRoutesTest.namesARepeatedField` checks a field sent twice (`/eventId appears more than once`).
 
 `switch` here is an expression (it returns a value), and because `Result` is sealed, it needs no `default`.
 
@@ -1216,14 +1272,41 @@ Content-type: application/problem+json
 Content-length: 323
 Cache-control: no-store
 
-{"type":"https://seatwave.example/problems/invalid-request","title":"The request does not match the contract","status":400,"detail":"/seat must be a section letter A to T, a hyphen and a number 1 to 1000; /customer must be 1 to 64 letters, digits, - or _","instance":"urn:seatwave:request:e5f47bad3cc94845b67fe96a7430a7f2"}
+{"type":"https://seatwave.example/problems/invalid-request","title":"The request does not match the contract","status":400,"detail":"/seat must be a section letter A to T, a hyphen and a number 1 to 1000; /customer must be 1 to 64 letters, digits, - or _","instance":"urn:seatwave:request:12c21b3555d044f6a43eb770f04d1b14"}
 ```
 
-4. Send a correct request. The route reaches the store, the store cannot get a connection, and the answer is `503` with `Retry-After`. Then ask for the wrong method on the same path, and read the counters.
+Two more bodies that the codec refuses: one names a field twice, one has text after the object. The first answer names the field with its pointer; the second has no pointer, so its detail starts with the reason itself.
+
+```bash
+curl -s -i -H 'Content-Type: application/json' -H 'Idempotency-Key: "k2"' --data '{"eventId":1,"eventId":2,"seat":"A-7","customer":"fan-1"}' http://127.0.0.1:22080/v1/holds | grep -v -i '^date'
+curl -s -i -H 'Content-Type: application/json' -H 'Idempotency-Key: "k3"' --data '{"eventId":1,"seat":"A-7","customer":"fan-1"} x' http://127.0.0.1:22080/v1/holds | grep -v -i '^date'
+```
+
+```text
+HTTP/1.1 400 Bad Request
+X-served-by: seatwave-local
+Content-type: application/problem+json
+Content-length: 233
+Cache-control: no-store
+
+{"type":"https://seatwave.example/problems/invalid-request","title":"The request does not match the contract","status":400,"detail":"/eventId appears more than once","instance":"urn:seatwave:request:98c9edcedfa74e4f96cbe56627205c39"}
+HTTP/1.1 400 Bad Request
+X-served-by: seatwave-local
+Content-type: application/problem+json
+Content-length: 241
+Cache-control: no-store
+
+{"type":"https://seatwave.example/problems/invalid-request","title":"The request does not match the contract","status":400,"detail":"the body has data after the JSON object","instance":"urn:seatwave:request:14f962aecf7e4c5aa8270e423fa83a49"}
+```
+
+4. Send a correct request. The route reaches the store, the store cannot get a connection, and the answer is `503` with `Retry-After`. Then ask for the wrong method on both paths: `GET` on `/v1/holds` and `DELETE` on one hold. Then send two `HEAD` requests with `curl -I`: one to `/health`, one to a hold. Last, read the counters.
 
 ```bash
 curl -s -i -H 'Content-Type: application/json' -H 'Idempotency-Key: "k1"' --data '{"eventId":1,"seat":"A-7","customer":"fan-1"}' http://127.0.0.1:22080/v1/holds | grep -v -i '^date'
 curl -s -i http://127.0.0.1:22080/v1/holds | grep -v -i '^date'
+curl -s -i -X DELETE http://127.0.0.1:22080/v1/holds/00000000-0000-0000-0000-000000000000 | grep -v -i '^date'
+curl -s -I http://127.0.0.1:22081/health | grep -v -i '^date'
+curl -s -I http://127.0.0.1:22080/v1/holds/00000000-0000-0000-0000-000000000000 | grep -v -i '^date'
 curl -s http://127.0.0.1:22081/metrics | grep -E 'requests_total|in_flight'
 ```
 
@@ -1235,7 +1318,7 @@ Retry-after: 1
 Content-length: 253
 Cache-control: no-store
 
-{"type":"https://seatwave.example/problems/service-busy","title":"SeatWave cannot reach its database; retry after Retry-After","status":503,"detail":"the shared database did not answer","instance":"urn:seatwave:request:52c68a0cc64c4da68e12888d653102d9"}
+{"type":"https://seatwave.example/problems/service-busy","title":"SeatWave cannot reach its database; retry after Retry-After","status":503,"detail":"the shared database did not answer","instance":"urn:seatwave:request:0bd6063a64584d6c9de313aadf5c4926"}
 HTTP/1.1 405 Method Not Allowed
 X-served-by: seatwave-local
 Allow: POST
@@ -1243,14 +1326,36 @@ Content-type: application/problem+json
 Content-length: 209
 Cache-control: no-store
 
-{"type":"https://seatwave.example/problems/method-not-allowed","title":"This path does not take this method","status":405,"detail":"use POST","instance":"urn:seatwave:request:40a4ee1a92e2440d9117a2bbc6fccaa0"}
+{"type":"https://seatwave.example/problems/method-not-allowed","title":"This path does not take this method","status":405,"detail":"use POST","instance":"urn:seatwave:request:2c78dfc5f72140dca6744c0366ed245c"}
+HTTP/1.1 405 Method Not Allowed
+X-served-by: seatwave-local
+Allow: GET, HEAD
+Content-type: application/problem+json
+Content-length: 214
+Cache-control: no-store
+
+{"type":"https://seatwave.example/problems/method-not-allowed","title":"This path does not take this method","status":405,"detail":"use GET, HEAD","instance":"urn:seatwave:request:99398d32ab67436491cc9bb088f3d65a"}
+HTTP/1.1 200 OK
+X-served-by: seatwave-local
+Content-type: application/json
+Cache-control: no-store
+
+HTTP/1.1 503 Service Unavailable
+X-served-by: seatwave-local
+Content-type: application/problem+json
+Retry-after: 1
+Cache-control: no-store
+
 # TYPE seatwave_requests_total counter
-seatwave_requests_total{route="POST /v1/holds",status="400"} 1
+seatwave_requests_total{route="GET /v1/holds/{holdId}",status="503"} 1
+seatwave_requests_total{route="POST /v1/holds",status="400"} 3
 seatwave_requests_total{route="POST /v1/holds",status="503"} 1
-seatwave_requests_total{route="other",status="405"} 1
+seatwave_requests_total{route="other",status="405"} 2
 # TYPE seatwave_in_flight gauge
 seatwave_in_flight 0
 ```
+
+The two `HEAD` answers have the status and headers of a `GET` and no body, and no `Content-length` either, because the server was told there is no body. The `HEAD` to the hold went to the store, like a `GET`, and so got the same `503`; it counts under `GET /v1/holds/{holdId}`. The three `400` answers are the ones from step 3.
 
 5. Stop the instance with the same signal Docker sends, and read what it printed. The exit status 143 is 128 plus 15, the number of SIGTERM.
 
@@ -1263,9 +1368,9 @@ grep -v DEBUG build/try/out.txt | cut -c1-200
 exit 143
 ```
 
-The log shows the lines `seatwave-local is READY`, a `WARN` line for the request that failed (it carries the request's id in square brackets), `seatwave-local is draining with 0 in flight`, and last `seatwave-local drained cleanly: 0 in flight left after 0 ms; 0 requests refused while not ready; stopped`.
+The log shows the lines `seatwave-local is READY`, a `WARN` line for each request the store could not answer (the hold, then the `HEAD` to a hold; each carries its request's id in square brackets), `seatwave-local is draining with 0 in flight`, and last `seatwave-local drained cleanly: 0 in flight left after 0 ms; 0 requests refused while not ready; stopped`.
 
-6. Run the tests of this part. `HoldRoutesTest` has sixteen tests and `SeatWaveServerTest` six.
+6. Run the tests of this part. `HoldRoutesTest` has nineteen tests and `SeatWaveServerTest` seven.
 
 ```bash
 ./gradlew --offline cleanTest test --tests '*HoldRoutesTest' --tests '*SeatWaveServerTest' 2>&1 | grep -E "FAILED|BUILD"
@@ -1283,7 +1388,7 @@ The only line printed is `BUILD SUCCESSFUL`, because the grep hides the `PASSED`
 - **Trusting `startsWith("application/json")`.** It accepts `application/jsonx`. `isJson` compares the whole media type.
 - **Answering readiness from the process alone.** An instance that cannot reach the database would receive traffic it must fail. `/ready` asks the store.
 - **Letting the liveness check depend on the database.** `/health` never asks it, so a database outage does not make a restart loop.
-- **Believing a `HEAD` request works on the checks port.** `HEAD /health` gets `404`, and the JDK server logs a warning "being invoked with a content length for a HEAD request". The balancer uses `GET`.
+- **Answering `HEAD` with a body, or not at all.** A `HEAD` reply must carry the headers of the `GET` reply and no body. Version 1.0.0 answered `HEAD /health` with `404`, and the JDK server logged a warning about a content length for a `HEAD` request. Now the checks and the hold path take `HEAD`, and `write` sends the length -1. The balancer itself uses `GET`.
 
 ## Check yourself
 

@@ -8,7 +8,7 @@ A **load balancer** is itself a machine that can die. If clients know only the a
 
 ## Why this repository uses it
 
-Module 10 asks two questions about the balancer pair. First: when the balancer that holds the address dies, how long are clients without service, and why? Second: when the dead balancer comes back, does the address move again (a second gap), or does it stay put? keepalived lets the lab answer both with real numbers. The README's pair lab shows a gap of 2.78 s for the first question, and `nopreempt` answers the second with "it stays".
+Module 10 asks two questions about the balancer pair. First: when the balancer that holds the address dies, how long are clients without service, and why? Second: when the dead balancer comes back, does the address move again (a second gap), or does it stay put? keepalived lets the lab answer both with real numbers. The pair lab of the re-measured run (version 1.1.0) shows a gap of 3.07 s for the first question, and `nopreempt` answers the second with "it stays".
 
 ## Where it appears
 
@@ -41,7 +41,7 @@ Module 10 asks two questions about the balancer pair. First: when the balancer t
 
 The two files are almost the same. This is the whole of `lb1.conf`.
 
-`keepalived/lb1.conf`, lines 1 to 42:
+`keepalived/lb1.conf`, lines 1 to 45:
 
 ```text
 # keepalived for balancer lb1 (Module 10): VRRP between lb1 and lb2 over unicast, so the pair
@@ -71,7 +71,10 @@ vrrp_instance seatwave_front {
   nopreempt
   interface eth0
   virtual_router_id 10
-  # lb1 wins the first election; the difference matters only then.
+  # Which balancer holds the address first is NOT set by this number. Each waits 3 adverts plus a
+  # skew of (256 - priority) / 256 s before it claims the address: 3.6055 s for 101, 3.6094 s for
+  # 100, only 4 ms apart, so the keepalived that started first usually wins. The higher priority
+  # decides only when both claim at the same moment. The labs read the holder, never assume it.
   priority 101
   # One advertisement a second: the backup takes over after 3 missed ones plus a skew.
   advert_int 1
@@ -111,7 +114,7 @@ The language is simple. A **block** has a name, then braces `{ ... }` around its
 - The comment before `state BACKUP` explains `state BACKUP` and `nopreempt` together. Both balancers start as BACKUP with `nopreempt`: the first to win the election keeps the address, and a balancer that comes back does not take it away again. The comment says "one move per failure, not two". (`nopreempt` only works if the initial state is BACKUP, which is why `state` is not MASTER on either machine.)
 - `interface eth0` is the network card that sends the messages and gets the address. `eth0` is the name of the card in the lab network (from the point of view of the balancer's container).
 - `virtual_router_id 10` is the VRID, the same in both files.
-- The comment above `priority 101` says "lb1 wins the first election; the difference matters only then". That is the intent. The effect is much smaller than the words suggest: see "What to know" below.
+- The four comment lines above `priority 101` say what the number does and what it does not. "Which balancer holds the address first is NOT set by this number." At the start, each keepalived waits 3 advertisements plus a skew of `(256 - priority) / 256` seconds before it claims the address: 3 + 155/256 = 3.6055 s for priority 101, and 3 + 156/256 = 3.6094 s for 100. The two waits are only 4 ms apart, so the keepalived whose container started first usually claims the address first, whatever its priority. The higher priority decides only when both claim at the same moment. That is why the labs read which side holds the address (`address_holder` in `scripts/common.sh`) and never assume it. Version 1.0.0's comment said "lb1 wins the first election", which the runs did not bear out; see "What to know" below.
 - `advert_int 1` is one advertisement a second. The comment says: the backup takes over after 3 missed ones plus a skew.
 - `unicast_src_ip 10.210.10.21` is the address this side sends from: `lb1`'s own address.
 - `unicast_peer { 10.210.10.22 }` lists the other side. Messages go straight to `lb2`. In `lb2.conf` the two are swapped.
@@ -120,19 +123,19 @@ The language is simple. A **block** has a name, then braces `{ ... }` around its
 
 ### What differs in `lb2`
 
-`diff keepalived/lb1.conf keepalived/lb2.conf` prints exactly four differences besides the comment on the first line: the name, the priority, and the two unicast addresses. These are the changed lines in `lb2.conf`:
+`diff keepalived/lb1.conf keepalived/lb2.conf` prints exactly four differences besides the comment on the first line: the name, the priority, and the two unicast addresses. The comment above the priority is the same in both files. These are the changed lines in `lb2.conf`:
 
 `keepalived/lb2.conf`, line 6:
 
 ```text
   router_id lb2
 ```
-`keepalived/lb2.conf`, line 29:
+`keepalived/lb2.conf`, line 32:
 
 ```text
   priority 100
 ```
-`keepalived/lb2.conf`, lines 32 to 34:
+`keepalived/lb2.conf`, lines 35 to 37:
 
 ```text
   unicast_src_ip 10.210.10.22
@@ -147,7 +150,7 @@ Everything else, including `virtual_router_id 10`, the check script and the floa
 
 ### What happens at start, in the logs
 
-This is the start of `keepalived-1` and `keepalived-2` on 11 November 2026 (`docker compose logs --no-log-prefix keepalived-1`), shortened:
+This is the start of `keepalived-1` and `keepalived-2` on 11 November 2026, in my own run of version 1.0.0 (the old run; `docker compose logs --no-log-prefix keepalived-1`), shortened. Version 1.1.0 changed only a comment in these files, so a start looks the same:
 
 ```
 Wed Nov 11 07:24:41 2026: Starting Keepalived v2.3.4 (06/10,2025)
@@ -164,20 +167,20 @@ Wed Nov 11 07:24:47 2026: (seatwave_front) Entering MASTER STATE
 
 ### What happens when the master's balancer is killed
 
-The pair lab does this under load (`scripts/lab.sh pair`, see `shell-scripts-walkthrough.md`). I did it without load: I killed `lb2` (`docker compose kill -s KILL lb2`) at 07:28:45 while `keepalived-2` was master. The logs:
+The pair lab does this under load (`scripts/lab.sh pair`, see `shell-scripts-walkthrough.md`). I did it without load, in my run of version 1.0.0: I killed `lb2` (`docker compose kill -s KILL lb2`) at 07:28:45 while `keepalived-2` was master. The logs:
 
 ```
 keepalived-2: Wed Nov 11 07:28:45 2026: (seatwave_front) Entering FAULT STATE
 keepalived-1: Wed Nov 11 07:28:48 2026: (seatwave_front) Entering MASTER STATE
 ```
 
-`keepalived-1` took over 3 seconds after the kill. The README's measurement under load shows a gap in client answers of 2.78 s (from +11.773 s to +14.550 s). The two fit the arithmetic: the timer is 3.6 s from the last advertisement, which arrived up to 1 s before the kill, so the takeover comes between 2.6 s and 3.6 s after it. Then the address moves and a gratuitous ARP tells the others.
+`keepalived-1` took over 3 seconds after the kill. The re-measured pair lab of version 1.1.0 ran the other way round: `keepalived-1` held the address, so the lab killed `lb1`, and its log shows `keepalived-1` in FAULT at 08:42:48 and `keepalived-2` entering MASTER at 08:42:51, again 3 seconds later. Under load that run shows a gap in client answers of 3.07 s (from +11.594 s to +14.668 s). Both fit the arithmetic: the backup's timer is 3.609 s from the last advertisement it heard (priority 100: 3 + 156/256), and that advertisement arrived up to 1 s before the kill, so the takeover comes between 2.609 s and 3.609 s after the kill. Then the address moves and a gratuitous ARP tells the others.
 
-After `scripts/lab.sh pair` starts `lb2` again and restarts `keepalived-2`, it enters BACKUP and `keepalived-1` stays MASTER, because of `nopreempt`: I saw `floating address` still on `keepalived-1` seven seconds later.
+After `scripts/lab.sh pair` starts the killed balancer again and restarts its keepalived, that keepalived enters BACKUP and the other stays MASTER, because of `nopreempt`. In my run of version 1.0.0 the address was still on `keepalived-1` seven seconds after `lb2` came back. In the re-measured run, `keepalived-1` entered BACKUP at 08:43:20 and the lab printed `floating address after lb1 came back: keepalived-2`.
 
 ### What happens when HAProxy stops answering but its container lives
 
-The kill above takes the whole network with it. A frozen balancer is another case: its container is alive, and only the check script can notice. I paused `lb1` while `keepalived-1` was master (`docker compose pause lb1`, which freezes its processes). The logs:
+The kill above takes the whole network with it. A frozen balancer is another case: its container is alive, and only the check script can notice. In my run of version 1.0.0, I paused `lb1` while `keepalived-1` was master (`docker compose pause lb1`, which freezes its processes). The logs:
 
 ```
 keepalived-1: Wed Nov 11 07:39:32 2026: VRRP_Script(haproxy_answers) failed (exited with status 1)
@@ -191,14 +194,14 @@ The pause was at 07:39:28; the script failed twice (`fall 2`, each failure a 1 t
 
 ### What to know about this design
 
-- **Priority 101 against 100 decides almost nothing.** Both skews are about 0.61 s, 4 ms apart. In the four fresh starts I know of (the README's and three of mine), `keepalived-2` held the address three times and `keepalived-1` once, although `lb1` has the higher priority. Which one wins is decided by small differences in start-up timing, not by the priority. The comment in `lb1.conf` ("lb1 wins the first election") is therefore not reliable. If the lab needs `lb1` to win, a much bigger priority difference would be needed, with a longer wait before the lower side declares itself master.
+- **Priority 101 against 100 decides almost nothing.** Both skews are about 0.61 s, 4 ms apart. In the four fresh starts of version 1.0.0 I know of (the old README's and three of mine), `keepalived-2` held the address three times and `keepalived-1` once, although `lb1` has the higher priority; in the re-measured run of version 1.1.0, `keepalived-1` held it. Which one wins is decided by small differences in start-up timing, not by the priority. Version 1.1.0's comment in both files says exactly that, and the labs read the holder instead of assuming it. If the lab needed `lb1` to win, a much bigger priority difference would be needed, with a longer wait before the lower side declares itself master.
 - **Both balancers share one Docker host and one network.** If the host dies, both die. The README says so under "What is simplified".
 - **The floating address exists only on the lab network.** The Mac cannot reach `10.210.10.100`; the harness container can.
 - **Split brain.** If the two sides cannot hear each other but both are alive, both become master and both hold the address. `scripts/lab.sh` refuses to run the pair lab when the address is "not on exactly one balancer".
 
 ## Try it yourself
 
-I ran these on 11 November 2026 (Docker 24.0.6, Compose v2.23.0-desktop.1) in a copy of the repository whose Compose project name is `seatwave-balancer-notes`; in the repository itself the name is `seatwave-balancer`, so use `-p seatwave-balancer` there. Run the `bash -c` commands from the repository folder. Start the stack with `scripts/stack.sh up --run --yes`. The times in your logs will differ.
+I ran these on 11 November 2026 (Docker 24.0.6, Compose v2.23.0-desktop.1) in a copy of the repository at version 1.0.0 (the old run) whose Compose project name is `seatwave-balancer-notes`; version 1.1.0 changed only comments in the keepalived files, so the steps behave the same; in the repository itself the name is `seatwave-balancer`, so use `-p seatwave-balancer` there. Run the `bash -c` commands from the repository folder. Start the stack with `scripts/stack.sh up --run --yes`. The times in your logs will differ.
 
 1. Which keepalived holds the floating address (the function from `scripts/common.sh`, run in Bash):
 
@@ -206,7 +209,7 @@ I ran these on 11 November 2026 (Docker 24.0.6, Compose v2.23.0-desktop.1) in a 
 bash -c 'source scripts/common.sh; address_holder'
 ```
 
-Output: `keepalived-2` in my first run. It can also be `keepalived-1` on another fresh start; see "What to know about this design".
+Output: `keepalived-2` in my first run, and `keepalived-1` in the re-measured run of version 1.1.0 (`scripts/stack.sh status` printed `floating address on: keepalived-1`). Either is possible on a fresh start; see "What to know about this design".
 
 2. The addresses of the two containers' cards (`ip` is the Linux tool that shows them):
 

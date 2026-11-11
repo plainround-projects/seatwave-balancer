@@ -80,9 +80,11 @@ db.user=seatwave
 db.passwordFile=/run/secrets/db_password
 # 16 connections per instance, 48 for three, under PostgreSQL's default limit of 100.
 db.poolSize=16
+# At least 250: HikariCP refuses a shorter connection timeout.
 db.connectTimeoutMillis=1000
 readiness.checkTimeoutMillis=1000
-# The longest a shutdown waits for in-flight requests; compose.yaml's stop_grace_period is longer.
+# The longest a shutdown waits for in-flight requests. With the 5 s the workers get after it, a stop
+# takes 25 s at most, inside compose.yaml's stop_grace_period of 30 s.
 drain.deadlineMillis=20000
 ```
 
@@ -97,9 +99,9 @@ drain.deadlineMillis=20000
 - `db.user=seatwave` is the database account. The pattern allows lower-case letters, digits and underscores.
 - `db.passwordFile=/run/secrets/db_password` is a path, not the password. Docker Compose mounts the password file made by `scripts/stack.sh` at that place (`docker-compose.md`). The program reads the file, so the password is never in a settings file or on a command line.
 - `db.poolSize=16` is the number of database connections one instance keeps open (`hikaricp.md`). The comment gives the arithmetic: 3 instances times 16 is 48, under PostgreSQL's default limit of 100 connections. The reader also refuses a pool larger than the worker count, because a connection no worker can use would be held open for nothing.
-- `db.connectTimeoutMillis=1000` is the longest a request waits for a free connection from the pool: one second.
+- `db.connectTimeoutMillis=1000` is the longest a request waits for a free connection from the pool: one second. The comment above it gives the lower bound: HikariCP, the pool library, refuses a connection timeout shorter than 250 milliseconds, so the reader refuses one too (`hikaricp.md`).
 - `readiness.checkTimeoutMillis=1000` is the longest the `/ready` check waits for the database. The reader refuses anything under 1000, because the JDBC call it uses counts whole seconds.
-- `drain.deadlineMillis=20000` is the longest a shutdown waits for requests in flight: 20 seconds. The comment says `compose.yaml`'s stop grace period is longer, so Docker does not kill an instance that is still draining.
+- `drain.deadlineMillis=20000` is the longest a shutdown waits for requests in flight: 20 seconds. The two comment lines above it add the rest of a stop: after the drain, the instance gives its worker threads 5 more seconds to finish. So a stop takes 25 s at most, inside `compose.yaml`'s `stop_grace_period` of 30 s, and Docker never kills an instance that is still draining (`docker-compose.md` shows the other half of the arithmetic, and `ServiceSettingsTest` checks it).
 
 ### `config/kill-production.properties`, a harness file key by key
 
@@ -252,7 +254,8 @@ load.seed=32
 `deploy-active-only.properties` is the same deploy measured through the active-only frontend (port 8082).
 
 ```properties
-# Lab 3: load to the floating address while lb1 is killed.
+# Lab 3: load to the floating address while the balancer that holds it is killed (scripts/lab.sh
+# pair reads which one holds it first).
 run.label=pair
 target.url=http://10.210.10.100:8080
 load.durationMillis=40000
@@ -261,7 +264,7 @@ report.victim=none
 load.seed=41
 ```
 
-`pair.properties` sends 40 s of load to the **floating address** `10.210.10.100` and watches both balancers (`lb1` and `lb2`, as two entries in `watch.balancers`). The first comment says "while lb1 is killed", but `scripts/lab.sh pair` kills whichever balancer holds the floating address at that moment (`lb2` in the README's captured run). The comment is imprecise; the key values are right.
+`pair.properties` sends 40 s of load to the **floating address** `10.210.10.100` and watches both balancers (`lb1` and `lb2`, as two entries in `watch.balancers`). The two comment lines say it exactly: the load goes to the floating address while the balancer that holds it is killed, and `scripts/lab.sh pair` first reads which one holds it. In the re-measured run of version 1.1.0 that was `keepalived-1`, so `lb1` was killed. (Version 1.0.0's comment said "while lb1 is killed", although that run killed `lb2`.)
 
 ### `config/deploy.properties`
 

@@ -139,9 +139,6 @@ public record ServiceSettings(
   private static final Pattern JDBC_URL =
       Pattern.compile("jdbc:(postgresql://[A-Za-z0-9.-]{1,100}:[0-9]{1,5}/[a-z_]{1,32}|h2:mem:.*)");
   private static final Pattern USER = Pattern.compile("[a-z_][a-z0-9_]{0,31}");
-  // Any path a file system accepts, spaces and long folders included, but no control character
-  // (a newline would let a value end one line of a log and start another).
-  private static final Pattern FILE = Pattern.compile("[^\\p{Cntrl}]{1,4096}");
   private static final int HIGHEST_PORT = 65_535;
   private static final int MAX_WORKERS = 1_024;
   private static final int MAX_BACKLOG = 65_535;
@@ -151,6 +148,8 @@ public record ServiceSettings(
   private static final int MAX_WAIT_MILLIS = 600_000;
   // JDBC's isValid counts whole seconds, so the readiness check cannot wait less than one.
   private static final int MIN_CHECK_MILLIS = 1_000;
+  // HikariCP refuses a connectionTimeout below 250 ms with an exception (HikariConfig, 7.1.0).
+  private static final int MIN_CONNECT_MILLIS = 250;
 ```
 
 These lines are the rules, written once as constants. `private static final` means: belongs to the class, not to one object, and never changes.
@@ -158,11 +157,11 @@ These lines are the rules, written once as constants. `private static final` mea
 - `ADDRESS` allows either `[0-9.]{7,15}` (a dotted IPv4 address: seven to fifteen digits and dots) or `[0-9a-fA-F:]{2,39}` (an IPv6 address: hexadecimal digits and colons). The pattern only filters the characters. `literal` below checks that the text really is an address. The comment says why host names are refused: a name needs the DNS service before the server could start.
 - `JDBC_URL` allows only the two databases this project runs. `jdbc:postgresql://host:port/name` is the stack. `jdbc:h2:mem:...` is the in-memory database that tests use. A JDBC URL (see `postgresql-and-h2.md`) is the text a Java program uses to find a database. Any other URL is a problem. The `|` in the pattern means "or". `.*` in the H2 branch means any characters, so a test may name its database.
 - `USER` is a database user name: a lowercase letter or an underscore first, then up to 31 more lowercase letters, digits or underscores. This is PostgreSQL's own habit for plain names.
-- `FILE` is a path as a file system can hold it: any character except a control character, from 1 to 4,096 characters. `\p{Cntrl}` is the class of control characters (a tab, a line break, the NUL byte). The comment gives the reason: a line break in a value could end one line of a log and start another, so someone could forge a log line. Spaces and long folders are allowed because a reader's copy of the project may sit in any folder. `ServiceSettingsTest.acceptsAPasswordFileInALongFolderWithSpaces` proves it.
 - The `HIGHEST_PORT` to `MAX_WAIT_MILLIS` constants are the upper limits. 65,535 is the highest TCP port. `MAX_POOL` is 100 because PostgreSQL's default `max_connections` is 100, and the comment says one instance never needs more. The underscore in `65_535` is only for reading: Java ignores it.
 - `MIN_CHECK_MILLIS` is 1,000. The comment gives the reason: JDBC's `isValid` counts whole seconds, so a readiness check cannot wait less than one second.
+- `MIN_CONNECT_MILLIS` is 250. The comment gives the reason: HikariCP, the connection pool library (see `hikaricp.md`), throws an exception for a connection timeout below 250 ms, and the comment names the class (`HikariConfig`) and the version (7.1.0) where that rule lives. Taking the library's own floor as the settings' floor turns a crash at start into one plain problem line. `ServiceSettingsTest.refusesAConnectTimeoutTheConnectionPoolCannotUse` sends 249 and expects `db.connectTimeoutMillis must be from 250 to 600000, but was 249`; `ServiceSettingsTest.opensThePoolWithTheShortestConnectTimeoutTheSettingsAllow` sends 250 and opens a real pool with it.
 
-One rough edge for a careful reader. Part 3 shows that the connection pool library refuses a connection timeout below 250 ms, while `db.connectTimeoutMillis` is allowed from 1 (line 89 below). The rule here is looser than the library's. Section "Mistakes people make" returns to it.
+There is no pattern for the password file's path here any more. The path is read with `reader.filePath`, which `SettingsReader` owns (see `java-config-json-walkthrough.md`), so every program of the project checks a path by the same rule.
 
 ```java
   /**
@@ -200,13 +199,18 @@ The **compact constructor** runs whenever a `ServiceSettings` is built, by `from
     int port = reader.intBetween("http.port", 0, HIGHEST_PORT);
     int adminPort = reader.intBetween("http.adminPort", 0, HIGHEST_PORT);
     int backlog = reader.intBetween("http.backlog", 1, MAX_BACKLOG);
+    int problemsBeforeWorkers = reader.problems().size();
     int workers = reader.intBetween("http.workerThreads", 1, MAX_WORKERS);
+    boolean workersRead = reader.problems().size() == problemsBeforeWorkers;
     int queue = reader.intBetween("http.queueCapacity", 1, MAX_QUEUE);
     String url = reader.textMatching("db.url", JDBC_URL);
     String user = reader.textMatching("db.user", USER);
-    String passwordFile = reader.textMatching("db.passwordFile", FILE);
+    String passwordFile = reader.filePath("db.passwordFile");
+    int problemsBeforePool = reader.problems().size();
     int poolSize = reader.intBetween("db.poolSize", 1, MAX_POOL);
-    Duration connect = reader.millisBetween("db.connectTimeoutMillis", 1, MAX_WAIT_MILLIS);
+    boolean poolRead = reader.problems().size() == problemsBeforePool;
+    Duration connect =
+        reader.millisBetween("db.connectTimeoutMillis", MIN_CONNECT_MILLIS, MAX_WAIT_MILLIS);
     Duration check =
         reader.millisBetween("readiness.checkTimeoutMillis", MIN_CHECK_MILLIS, MAX_WAIT_MILLIS);
     Duration drain = reader.millisBetween("drain.deadlineMillis", 0, MAX_WAIT_MILLIS);
@@ -219,9 +223,11 @@ Each line reads one key. The reader records a problem and returns a stand-in whe
 - `http.bindAddress`: text matching `ADDRESS`.
 - `http.port`, `http.adminPort`: whole numbers from 0 to 65,535.
 - `http.backlog`: from 1 to 65,535. `http.workerThreads`: 1 to 1,024. `http.queueCapacity`: 1 to 100,000.
-- `db.url`, `db.user`, `db.passwordFile`: text matching `JDBC_URL`, `USER` and `FILE`. The file holds the password. The settings file never holds the password itself, so a settings file can be shown or committed.
-- `db.poolSize`: 1 to 100.
-- `db.connectTimeoutMillis`: a `Duration` of 1 to 600,000 milliseconds. This is how long a request waits to get a connection from the pool.
+- `problemsBeforeWorkers` and `workersRead` wrap the line that reads `http.workerThreads`. `reader.problems().size()` is the number of problems found so far. The code counts them just before the read and compares just after it: if the count did not grow, this key was read without a problem, and `workersRead` is `true`. `==` compares two numbers and gives a `boolean` (a value that is `true` or `false`). The reason is in the rule further down.
+- `db.url`, `db.user`: text matching `JDBC_URL` and `USER`.
+- `db.passwordFile`: read with `reader.filePath`, the reader's own rule for a path (any character but a control character, up to 4,096 characters). The file holds the password. The settings file never holds the password itself, so a settings file can be shown or committed.
+- `db.poolSize`: 1 to 100. `problemsBeforePool` and `poolRead` do for this key what the two lines above did for the worker count.
+- `db.connectTimeoutMillis`: a `Duration` of 250 to 600,000 milliseconds (`MIN_CONNECT_MILLIS` to `MAX_WAIT_MILLIS`). This is how long a request waits to get a connection from the pool. The statement is split over two lines only to stay short.
 - `readiness.checkTimeoutMillis`: from `MIN_CHECK_MILLIS` to 600,000.
 - `drain.deadlineMillis`: 0 to 600,000. Zero means "do not wait".
 
@@ -229,7 +235,9 @@ Each line reads one key. The reader records a problem and returns a stand-in whe
     if (port != 0 && port == adminPort) {
       reader.addProblem("http.port and http.adminPort must differ (0 means any free port)");
     }
-    if (poolSize > workers) {
+    // A rule between two keys is checked only when both were read, so a missing key gives one
+    // problem line, not a second one about the stand-in value.
+    if (workersRead && poolRead && poolSize > workers) {
       reader.addProblem(
           "db.poolSize must not be larger than http.workerThreads: a connection no worker can use"
               + " is held open at the database for nothing");
@@ -237,6 +245,8 @@ Each line reads one key. The reader records a problem and returns a stand-in whe
 ```
 
 Two rules that involve two keys each. A single key cannot know about the other, so the code checks after both are read.
+
+Why the pool rule needs `workersRead && poolRead`. When a key is missing or wrong, the reader records one problem and hands back a stand-in, the smallest allowed value. Without the guard, a file with no `http.workerThreads` would get the stand-in 1, and a pool of 16 would then also break the rule `poolSize > workers`: the reader would see two problem lines for one mistake, and the second one talks about a number the file never said. The comment says it in one sentence: a missing key gives one problem line, not a second one about the stand-in value. `&&` means "and", and Java stops at the first `false`, so `poolSize > workers` is only compared when both keys were read. `ServiceSettingsTest.reportsAMissingWorkerCountOnceWithoutTheRuleThatNeedsIt` removes `http.workerThreads` and expects exactly one line, `http.workerThreads is missing`.
 
 - The two ports must differ. This repeats the compact constructor's rule on purpose: the constructor throws, which is right for a bug, while this adds a problem sentence, which is right for a typo in a file. The words "0 means any free port" explain the exception.
 - `poolSize > workers` is refused. A pool bigger than the number of threads that use it would hold database connections that nothing can use. Each open connection costs the database memory, so the sentence says "held open at the database for nothing". The sentence is built from two string pieces joined with `+`, which is only a way to keep the line short.
@@ -895,7 +905,7 @@ Eleven lines end in `PASSED`, for example `LifecycleTest > admitsNothingAfterDra
 ./gradlew --offline cleanTest test --tests '*ServiceSettingsTest' 2>&1 | grep -E "PASSED|FAILED|BUILD"
 ```
 
-Six tests pass. One of them reads the real file `config/seatwave-container.properties` and checks that it is valid.
+Eleven tests pass. One of them reads the real file `config/seatwave-container.properties` and checks that it is valid. Two of them are about the rules added in version 1.1.0: `refusesAConnectTimeoutTheConnectionPoolCannotUse` and `reportsAMissingWorkerCountOnceWithoutTheRuleThatNeedsIt`.
 
 3. Collect the jar and its libraries, and start the program with nothing. It prints its usage and exits with status 2.
 
@@ -905,7 +915,7 @@ java -cp 'build/stack/lib/*' io.plainround.seatwave.balancer.seatwave.SeatWaveCl
 ```
 
 ```text
-usage: serve <seatwave.properties> <instance name, such as seatwave-1>
+usage: SeatWaveCli <seatwave.properties> <instance name, such as seatwave-1>
 exit 2
 ```
 
@@ -932,7 +942,8 @@ An instance runs for real only in Docker Compose, where the database lives at `1
 - **Forgetting `finally` after `lock.lock()`.** An exception between lock and unlock would leave the lock taken for ever. Every lock use in `Lifecycle` has the `try`/`finally` pair.
 - **Waiting with `if` instead of `while`.** A condition wait can wake up without a signal. The loop checks the condition again.
 - **Closing a ticket twice and counting twice.** `Admission.close` is idempotent (safe to repeat) through `compareAndSet`.
-- **Letting a settings rule be looser than the library behind it.** `db.connectTimeoutMillis` is accepted from 1 millisecond, but the connection pool library refuses anything under 250. A file with `db.connectTimeoutMillis=100` passes `ServiceSettings.from` and then the instance dies with a stack trace and exit status 1 (not the documented 2). Part 3 shows the run. The fix is to raise the minimum in `ServiceSettings` to 250.
+- **Letting a settings rule be looser than the library behind it.** The connection pool library refuses a connection timeout under 250 ms with an exception. Version 1.0.0 of this project accepted `db.connectTimeoutMillis` from 1, so a file with 100 passed the checks and the instance died with a stack trace and exit status 1. Since version 1.1.0 the minimum is `MIN_CONNECT_MILLIS`, 250, the library's own floor, and the same file gets one problem line and exit status 2. Part 3 shows the run.
+- **Reporting a rule between two keys about a stand-in value.** A missing key comes back as its smallest allowed value, so a rule that compares it with another key would add a second, confusing problem line. `from` checks the pool rule only when both keys were read (`workersRead && poolRead`).
 - **Treating a broken database like a business answer.** "The seat is taken" is a `Result`. "The database did not answer" is an exception. Mixing them would let a database outage look like a sold-out show.
 - **Using `find()` where `matches()` is meant.** `HoldCommand.require` uses `matches()`, so the whole value must fit the rule.
 

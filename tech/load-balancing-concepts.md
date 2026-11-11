@@ -55,7 +55,7 @@ This repository uses layer 7 (`mode http` in the `defaults` section) because the
 | Least connections | The server with the fewest open connections now | Requests of very different durations | `balance leastconn` in `seatwave_leastconn` |
 | Source hash | A hash of the client's address picks the server, so one client always meets the same server | Needing "stickiness" without cookies | `balance source` with `hash-type consistent` in `seatwave_source` |
 
-The share lab measures them with 3,000 requests a second for 20 seconds each. The README's lines show: round robin 33.3% for each instance; least connections 33.5%, 33.3% and 33.2%; weighted 50.0%, 25.0% and 25.0%; source hashing 100% on one instance, because the harness is one client.
+The share lab measures them with 3,000 requests a second for 20 seconds each. The re-measured run of version 1.1.0 shows: round robin 33.3% for each instance; least connections 33.3%, 33.6% and 33.2%; weighted 50.0%, 25.0% and 25.0%; source hashing 100% on one instance, because the harness is one client.
 
 Two more things the algorithms do not say. First, **stickiness** (always the same server for one client) is only needed when a server keeps something in memory about the client. SeatWave's instances keep nothing: every hold is in the shared database, so any instance can answer for any hold, and a retried `POST /v1/holds` with the same `Idempotency-Key` returns the same hold from any instance. That is called a **stateless** instance, and it is what makes round robin safe. Second, **consistent hashing** places servers and keys on a ring so that, when one server leaves, only the clients that were on it move.
 
@@ -68,9 +68,9 @@ A balancer must stop sending requests to a dead server. It learns that in two wa
 
 Why both? The active check works without traffic and can bring a server back up. The passive check is fast when traffic is heavy. PRODUCTION has both and SIMPLE has the active check only; the labs compare them.
 
-**Detection time** is the time from the instance's death to the moment the balancer stops sending it requests. It decides how many requests fail. For the active check alone it is roughly `fall × (time one failed check takes + inter)`. In this lab a failed check on a dead address takes 2 s (the connect timeout) and the next waits 2 s (`inter`), so each failure costs about 4 s, and three of them cost about 12 s. The README measured 11.82 s. Compare 13.4 ms with the passive check in PRODUCTION.
+**Detection time** is the time from the instance's death to the moment the balancer stops sending it requests. It decides how many requests fail. For the active check alone it is roughly `fall × (time one failed check takes + inter)`. In this lab a failed check on a dead address takes 2 s (its connect wait) and the next starts 2 s later (`inter`), so each failure costs about 4 s, and three of them cost about 12 s, counted from the start of the first failed check. The re-measured run of version 1.1.0 found 10.87 s from the instance's last answer, because the first failed check had started less than a second after the kill (`haproxy-config-walkthrough.md` works it through). Compare 52.7 ms with the passive check in PRODUCTION.
 
-**Little's Law** gives the cost in failed requests. The average number of things in a system equals the rate they arrive times the time each stays. Here: requests a second, times the share that went to the dead instance, times the detection time. 3,000 × 0.333 × 11.824 s is 11,824, and the README counted 11,777 failed requests. A shorter detection time is the only way to cut this number, apart from retrying.
+**Little's Law** gives the cost in failed requests. The average number of things in a system equals the rate they arrive times the time each stays. Here: requests a second, times the share that went to the dead instance, times the detection time. 3,000 × 0.3333 × 10.872 s is 10,871, the number the re-measured run printed. That run counted 7,653 failed requests. The other 3,218 were reads that the harness's own client tried once more on a new connection, as a fan's app would; such a client never repeats a hold, a `POST`. A shorter detection time is the only way to cut this number, apart from retrying.
 
 ### Retries: hiding a failure from the client
 
@@ -78,7 +78,7 @@ A **retry** sends a request again, to another server, when the first attempt fai
 
 ### Draining and graceful shutdown
 
-When you want to take a server out for a deploy, killing it fails the requests it is serving. A **drain** avoids that in two steps. First tell the balancer to send the server no new requests (`DRAIN` state). Then wait until the requests it is already serving finish (`scur`, the current sessions, reaches 0). Then stop it. SeatWave adds a second layer: when it receives SIGTERM it stops admitting new requests (it answers 503 with `Connection: close`) and exits only when the running ones are done or a deadline of 20 s passes. The rolling deploy of this repository uses both, one instance at a time, and the README's deploy run shows 299,999 requests sent and 0 failed.
+When you want to take a server out for a deploy, killing it fails the requests it is serving. A **drain** avoids that in two steps. First tell the balancer to send the server no new requests (`DRAIN` state). Then wait until the requests it is already serving finish (`scur`, the current sessions, reaches 0). Then stop it. SeatWave adds a second layer: when it receives SIGTERM it stops admitting new requests (it answers 503 with `Connection: close`) and exits only when the running ones are done or a deadline of 20 s passes. The rolling deploy of this repository uses both, one instance at a time, and the re-measured deploy run of version 1.1.0 shows 300,000 requests sent and 0 failed.
 
 ### Slow start: not hurting a cold server
 
@@ -86,7 +86,7 @@ A server that has just started is "cold": its caches are empty, its connections 
 
 ### The balancer as a single point of failure
 
-If everything goes through one balancer, its death is the service's death. A **redundant pair** has two balancers and one address that moves between them (see `keepalived-vrrp.md`). Only one holds the address at a time (**active-passive**). When the holder dies, the other takes the address after about three missed advertisements: in the README, 2.78 s of failed connections. The failure shows up as `HttpConnectTimeoutException` in the harness, because while no one holds the address, nobody answers the connection.
+If everything goes through one balancer, its death is the service's death. A **redundant pair** has two balancers and one address that moves between them (see `keepalived-vrrp.md`). Only one holds the address at a time (**active-passive**). When the holder dies, the other takes the address after about three missed advertisements: in the re-measured run of version 1.1.0, 3.07 s of failed connections. The failure shows up as `HttpConnectTimeoutException` in the harness, because while no one holds the address, nobody answers the connection.
 
 A pair does not remove every single point of failure. The two balancers here share one Docker host, one network and one database. The README names these limits under "What is simplified".
 
@@ -94,31 +94,31 @@ A pair does not remove every single point of failure. The two balancers here sha
 
 The lines that carry each idea, in `haproxy/haproxy.cfg`. The balance lines:
 
-`haproxy/haproxy.cfg`, line 57:
+`haproxy/haproxy.cfg`, line 66:
 
 ```text
   balance roundrobin
 ```
-`haproxy/haproxy.cfg`, lines 90 to 91:
+`haproxy/haproxy.cfg`, lines 103 to 104:
 
 ```text
 backend seatwave_leastconn
   balance leastconn
 ```
-`haproxy/haproxy.cfg`, lines 100 to 102:
+`haproxy/haproxy.cfg`, lines 113 to 115:
 
 ```text
 backend seatwave_source
   balance source
   hash-type consistent
 ```
-`haproxy/haproxy.cfg`, lines 111 to 112:
+`haproxy/haproxy.cfg`, lines 124 to 125:
 
 ```text
 backend seatwave_weighted
   balance roundrobin
 ```
-`haproxy/haproxy.cfg`, line 116:
+`haproxy/haproxy.cfg`, line 129:
 
 ```text
   server seatwave-1 10.210.10.11:8080 weight 2 track seatwave/seatwave-1
@@ -127,13 +127,13 @@ Round robin in PRODUCTION; least connections; source hashing with consistent has
 
 The active check, the passive check and slow start, in one line of defaults, and the retries:
 
-`haproxy/haproxy.cfg`, lines 62 to 63:
+`haproxy/haproxy.cfg`, lines 71 to 72:
 
 ```text
   retries 2
   option redispatch 1
 ```
-`haproxy/haproxy.cfg`, lines 67 to 68:
+`haproxy/haproxy.cfg`, lines 80 to 81:
 
 ```text
   retry-on conn-failure empty-response 503
@@ -143,7 +143,7 @@ Every item in the second line, in order, is explained in `haproxy-config-walkthr
 
 The SIMPLE backend turns the safety nets off, to make the comparison visible:
 
-`haproxy/haproxy.cfg`, lines 81 to 83:
+`haproxy/haproxy.cfg`, lines 94 to 96:
 
 ```text
   retries 0
@@ -156,16 +156,16 @@ The shared state that makes any instance able to serve any request is `db/schema
 
 | Experiment | What the README measured | What it shows |
 |---|---|---|
-| Kill an instance behind the active check only | 11,777 of 89,999 requests failed; the instance was removed 11.82 s after its last answer | Detection time times rate times share is the loss |
-| The same kill behind PRODUCTION | 0 failed; removed 13.4 ms after its last answer (6 retries, 9 redispatches) | Passive check and retries hide the kill |
-| Rolling deploy of all three instances behind PRODUCTION | 0 failed of 299,999 | Drain first, stop, wait until seen down, start, slow start |
-| Kill the balancer that holds the floating address | 8,315 of 119,999 failed; longest gap between two answers 2,777.1 ms | VRRP takes about three missed advertisements plus a skew |
+| Kill an instance behind the active check only | 7,653 of 90,000 requests failed; the instance was removed 10.87 s after its last answer | Detection time times rate times share is the loss |
+| The same kill behind PRODUCTION | 0 failed; removed 52.7 ms after its last answer (13 retries, 18 redispatches) | Passive check and retries hide the kill |
+| Rolling deploy of all three instances behind PRODUCTION | 0 failed of 300,000 | Drain first, stop, wait until seen down, start, slow start |
+| Kill the balancer that holds the floating address | 9,215 of 120,000 failed; longest gap between two answers 3,073.9 ms | VRRP takes about three missed advertisements plus a skew |
 
-I did not rerun these loads: they need the harness at 3,000 requests a second inside the lab network, and this note's author ran only small sequential tests (below). The numbers are the README's.
+I did not rerun these loads: they need the harness at 3,000 requests a second inside the lab network, and this note's author ran only small sequential tests (below). The numbers are those of the re-measured run of version 1.1.0, the run the README reports.
 
 ## Try it yourself
 
-I ran these on 11 November 2026 against the running stack (see `docker.md` for the setup); the counts differ on every run.
+I ran these on 11 November 2026 against the running stack of version 1.0.0 (the old run; see `docker.md` for the setup); the counts differ on every run. Version 1.1.0 added the `cpu` lab and changed the scripts' guardrails, not these plans; `shell-scripts-walkthrough.md` shows the version 1.1.0 dry runs.
 
 1. The plan of each lab, without running anything (the scripts are dry runs by default):
 
@@ -222,7 +222,7 @@ Never `seatwave-3`. After `ready`, `show stat` showed all three instances `UP` a
 1. What is the difference between a layer 4 and a layer 7 balancer?
    *Layer 4 sees only TCP connections and copies bytes. Layer 7 reads each HTTP request, so it can route by port or path, add headers, check status codes and retry one request.*
 2. Why does PRODUCTION have both an active and a passive check?
-   *The active check finds failures without traffic and brings servers back up; the passive check reacts at the speed of real traffic, which cut the removal time from 11.82 s to 13.4 ms in the README.*
+   *The active check finds failures without traffic and brings servers back up; the passive check reacts at the speed of real traffic, which cut the removal time from 10.87 s to 52.7 ms in the re-measured run.*
 3. How many requests fail if a server dies, with no retries, at 3,000 requests a second, three servers, and an 11.8 s detection time?
    *About 3,000 × (1/3) × 11.8, which is about 11,800.*
 4. Why is it safe to retry `POST /v1/holds`?

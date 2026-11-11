@@ -8,7 +8,7 @@ Two tools, two jobs: Spotless is the Gradle plugin in version 8.11.0. google-jav
 
 ## Why this repository uses it
 
-With one enforced layout nobody argues about style, reviews show only real changes, and nobody formats by hand. The README lists Spotless in its table of tools, and `./gradlew check` runs `spotlessCheck`, so an unformatted file stops the gate. This repository has 40 main and 21 test Java files, written in parts by several authors and tools, so one enforced layout is what keeps them looking like one code base.
+With one enforced layout nobody argues about style, reviews show only real changes, and nobody formats by hand. The README lists Spotless in its table of tools, and `./gradlew check` runs `spotlessCheck`, so an unformatted file stops the gate. This repository has 40 main and 27 test Java files, written in parts by several authors and tools, so one enforced layout is what keeps them looking like one code base.
 
 ## Where it appears
 
@@ -16,7 +16,7 @@ With one enforced layout nobody argues about style, reviews show only real chang
 | --- | --- |
 | `build.gradle.kts` | Switches the plugin on (`alias(libs.plugins.spotless)`) and configures it (`spotless { java { ... } }`). |
 | `gradle/libs.versions.toml` | Holds the two versions: `spotless = "8.11.0"` and `googleJavaFormat = "2.0.0"`. |
-| `src/main/java/**`, `src/test/java/**` | The files it checks (every Java source file of the project, 40 main files and 21 test files). |
+| `src/main/java/**`, `src/test/java/**` | The files it checks (every Java source file of the project, 40 main files and 27 test files). |
 | `.editorconfig` | Declares two-space indentation for Java, the same as the formatter (`editorconfig.md`). |
 
 ## How it works underneath
@@ -26,7 +26,7 @@ With one enforced layout nobody argues about style, reviews show only real chang
 3. `./gradlew spotlessApply` writes the formatted result back into the files.
 4. Spotless remembers what it checked, so unchanged files are skipped. A second run prints `UP-TO-DATE`.
 
-google-java-format's rules, as they show in this repository's code: two spaces of indentation, four spaces for a continued line, a hard limit of 100 columns, one statement per line, braces always, a blank line between methods, and imports sorted in ASCII order with all `import static` lines first. Three lines of this repository are longer than 100 columns (101, 101 and 111), and each one is a single string literal (a piece of text in double quotes) that the formatter cannot break without changing the text: expected text in `RollingDeployTest.java` (line 79), `RuntimeApiTest.java` (line 75) and `RunReportTest.java` (line 162).
+google-java-format's rules, as they show in this repository's code: two spaces of indentation, four spaces for a continued line, a hard limit of 100 columns, one statement per line, braces always, a blank line between methods, and imports sorted in ASCII order with all `import static` lines first. Four lines of this repository are longer than 100 columns (101, 101, 101 and 111), and each one is a single string literal (a piece of text in double quotes) that the formatter cannot break without changing the text: expected text in `RollingDeployTest.java` (line 115), `DeploySettingsTest.java` (line 35), `RuntimeApiTest.java` (line 75) and `RunReportTest.java` (line 175).
 
 ## Walkthrough of this repository's use
 
@@ -46,7 +46,7 @@ spotless {
 - `removeUnusedImports()` deletes `import` lines whose names are never used. Spotless does this with its own step; the formatter alone does not.
 - `endWithNewline()` makes sure the last character of each file is a line break.
 
-The plugin itself is switched on in line 15 of the build file with `alias(libs.plugins.spotless)` (`gradle.md`).
+The plugin itself is switched on in line 4 of the build file with `alias(libs.plugins.spotless)` (`gradle.md`).
 
 ### An experiment in a scratch copy
 

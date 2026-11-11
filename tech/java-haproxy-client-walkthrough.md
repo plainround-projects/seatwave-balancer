@@ -70,9 +70,10 @@ package io.plainround.seatwave.balancer.haproxy;
 import java.util.Locale;
 import java.util.Objects;
 import java.util.regex.Pattern;
+import java.util.stream.Collectors;
 ```
 
-These are the imports. `package` says which folder-like group of classes this file belongs to. Each `import` lets the file use a class from another package by its short name. `Locale` controls how text changes case, `Objects` has null checks, and `Pattern` is a compiled **regular expression**: a short text that describes which strings are allowed.
+These are the imports. `package` says which folder-like group of classes this file belongs to. Each `import` lets the file use a class from another package by its short name. `Locale` controls how text changes case, `Objects` has null checks, and `Pattern` is a compiled **regular expression**: a short text that describes which strings are allowed. `Collectors` gathers the items of a stream into one result; `visible` below uses it.
 
 ```java
 /**
@@ -146,13 +147,35 @@ This is a **compact constructor**: it is written without a parameter list and ru
   private static String checked(String name, String what) {
     Objects.requireNonNull(name, what);
     if (!NAME.matcher(name).matches()) {
-      throw new IllegalArgumentException(what + " must match " + NAME.pattern() + ": " + name);
+      throw new IllegalArgumentException(
+          what + " must match " + NAME.pattern() + ", but was \"" + visible(name) + "\"");
     }
     return name;
   }
+
+  private static String visible(String text) {
+    // A control character is shown as its code, so a newline in a name cannot break the message
+    // into two lines (one of which a reader would take for another message).
+    return text.codePoints()
+        .mapToObj(codePoint ->
+            Character.isISOControl(codePoint)
+                ? String.format(Locale.ROOT, "\\u%04x", codePoint)
+                : Character.toString(codePoint))
+        .collect(Collectors.joining());
+  }
 ```
 
-`checked` returns the name unchanged if the whole name matches the pattern, and throws otherwise. `matcher(name).matches()` asks whether the entire text fits the pattern, not just a part of it. The message names which argument was wrong (`backend` or `server`) and prints the pattern. A message that includes the bad value prints a newline if the value contained one. That is harmless here, because the value never reaches HAProxy.
+`checked` returns the name unchanged if the whole name matches the pattern, and throws otherwise. `matcher(name).matches()` asks whether the entire text fits the pattern, not just a part of it. The message names which argument was wrong (`backend` or `server`), prints the pattern, and then the bad value in double quotes, written with `\"` because a plain `"` would end the Java text.
+
+The bad value goes through `visible` first. A **control character** is a character that is not printed but does something, such as a newline (code 10) or a tab (code 9). The comment says why they are replaced: a newline inside a name would break the message into two lines, and a reader could take the second line for another message.
+
+- `text.codePoints()` gives the characters of the text as a stream of numbers, one **code point** (the character's number in Unicode) each.
+- `mapToObj` turns each number back into a piece of text. `Character.isISOControl(codePoint)` is true for the control characters (codes 0 to 31 and 127 to 159).
+- A control character becomes `\u` and its code as four hexadecimal digits: `String.format(Locale.ROOT, "\\u%04x", codePoint)`, where `\\` in Java source is one backslash, `%04x` is the number in hexadecimal padded with zeros to four digits. A newline becomes the six characters `\u000a`.
+- Any other character is kept as it is with `Character.toString(codePoint)`.
+- `Collectors.joining()` glues the pieces back into one text.
+
+So `setState("seatwave", "a\nb", ...)` fails with a one-line message that ends in `but was "a\u000ab"`. Version 1.0.0 printed the raw newline.
 
 ```java
   /** The administrative states the runtime API can set on a server. */
@@ -331,14 +354,15 @@ import java.util.regex.Pattern;
  */
 public record NamedBalancer(String name, RuntimeApi api) {
 
+  // A port from 1 up, without a leading zero; the address is checked once it is parsed.
   private static final Pattern ENTRY =
-      Pattern.compile("([a-z][a-z0-9-]{0,31})=([0-9.]{7,15}):([0-9]{1,5})");
+      Pattern.compile("([a-z][a-z0-9-]{0,31})=([0-9.]{7,15}):([1-9][0-9]{0,4})");
   private static final int HIGHEST_PORT = 65_535;
 ```
 
 A balancer is its name and its `RuntimeApi`. The name is the one that HAProxy puts in the `X-Balancer` response header, so the harness can count answers per balancer.
 
-`ENTRY` says what one list item looks like. The pattern `([a-z][a-z0-9-]{0,31})=([0-9.]{7,15}):([0-9]{1,5})` has three **groups**, the parts in parentheses: a name that starts with a lowercase letter (one to 32 characters), then `=`, then an address made of seven to 15 digits and dots, then `:`, then one to five digits for the port. `HIGHEST_PORT` is 65,535, the largest port number.
+`ENTRY` says what one list item looks like. The pattern `([a-z][a-z0-9-]{0,31})=([0-9.]{7,15}):([1-9][0-9]{0,4})` has three **groups**, the parts in parentheses: a name that starts with a lowercase letter (one to 32 characters), then `=`, then an address made of seven to 15 digits and dots, then `:`, then a port of one to five digits whose first digit is 1 to 9. The comment says what that last part rules out: port 0 and a leading zero such as `09999`. The address is checked once it is parsed, in `parse` below. `HIGHEST_PORT` is 65,535, the largest port number.
 
 ```java
   /** Checks the fields. */
@@ -374,6 +398,12 @@ The compact constructor only checks for null.
       } catch (IllegalArgumentException notAnAddress) {
         return Result.error("'" + entry + "' does not hold an IP address");
       }
+      // ofLiteral also reads short and padded forms (127.0.1, 010.0.0.1); only the dotted form
+      // that prints back the same is the address the reader meant.
+      if (!address.getHostAddress().equals(matcher.group(2))) {
+        return Result.error(
+            "'" + entry + "' does not hold a dotted IPv4 address with four parts and no padding");
+      }
       balancers.add(
           new NamedBalancer(
               matcher.group(1),
@@ -382,6 +412,7 @@ The compact constructor only checks for null.
     }
     return Result.success(List.copyOf(balancers));
   }
+}
 ```
 
 `parse` turns a list such as `lb1=10.210.10.21:9999,lb2=10.210.10.22:9999` (already split at the commas by the settings reader) into balancers.
@@ -389,10 +420,9 @@ The compact constructor only checks for null.
 - The generic type `Result<List<NamedBalancer>, String>` reads "either a list of balancers, or a text that explains the first problem".
 - For each entry the code asks the `Matcher` whether the whole entry fits `ENTRY`. A `Matcher` holds the result of applying a pattern to a text. If it does not fit, or the port number is larger than 65,535, the method returns `Result.error(...)` at once, with a message that shows the expected shape. The pattern cannot rule out `99999` by itself, which is why the port is compared as a number.
 - `matcher.group(2)` is the address text. `InetAddress.ofLiteral` turns text into an address object and throws `IllegalArgumentException` if the text is not an address, without asking the network (a name such as `lb1.example` would otherwise cost a DNS lookup). For `999.210.10.21` the pattern passes but `ofLiteral` refuses, and the message says "does not hold an IP address".
+- `ofLiteral` also accepts forms a reader would not expect, as the comment says. I ran it on Java 25.0.2: `127.0.1` reads as `127.0.0.1` (the JDK reads the last number as the remaining two bytes), and `010.0.0.1` reads as `10.0.0.1` (the leading zero is dropped). `address.getHostAddress()` prints the address back in its full dotted form. If that differs from the text in the entry, the entry was written in a short or padded form, and the method returns the error "does not hold a dotted IPv4 address with four parts and no padding". Version 1.0.0 accepted both forms; the test `refusesTheShortAndPaddedFormsOfAnEntry` in `RuntimeApiTest` now checks the refusal.
 - A new `NamedBalancer` is built with `new InetSocketAddress(address, port)`. The same `timeout` is given to every balancer.
 - `List.copyOf` returns a list that cannot be changed, and `Result.success` wraps it.
-
-One thing the tests do not show: `ofLiteral` accepts short forms. I ran the parser in a scratch copy and `lb1=127.0.1:9999` parsed as the address `127.0.0.1`, because the JDK reads `127.0.1` as 127, 0, 0, 1. The entry pattern also accepts a leading zero in the port (`09999` is read as 9999). Neither can hurt in this lab, since the settings files are written by the project, but a stricter pattern would reject them.
 
 ### `haproxy/StatRow.java`
 
@@ -400,7 +430,6 @@ One thing the tests do not show: `ofLiteral` accepts short forms. I ran the pars
 package io.plainround.seatwave.balancer.haproxy;
 
 import java.util.Map;
-import java.util.Objects;
 
 /**
  * One row of {@code show stat}, read by the column names HAProxy's management guide lists. A
@@ -455,11 +484,22 @@ A `StatRow` holds a `Map<String, String>`: a collection that finds a value by it
   public boolean isUp() {
     return status().startsWith("UP");
   }
+
+  /**
+   * Says whether the server is up and passing its checks, with no failed check counted against it.
+   *
+   * @return true for exactly UP; false for "UP 1/3" and "UP 2/3", which are falling
+   */
+  public boolean isFullyUp() {
+    return status().equals("UP");
+  }
 ```
 
 Each of these methods reads one column by name and gives it a meaningful Java name. `proxy()` returns `pxname`, `server()` returns `svname`, `status()` returns `status`. They return the text as HAProxy wrote it.
 
 `isUp()` says whether the balancer may send new requests now. It returns true if the status starts with `UP`. That includes `UP 2/3` and `UP 1/3`, because a server whose checks have started to fail still gets requests until the third failure. `DRAIN`, `MAINT`, `DOWN` and `NOLB` all return false.
+
+`isFullyUp()` is stricter: it is true only for the exact text `UP`. A server at `UP 1/3` or `UP 2/3` has failed checks counted against it and is on its way down, as the Javadoc says. The rolling deploy (`deploy/RollingDeploy.java`) uses this method before it changes anything and after a restart, so it never takes an instance out while another one is already failing.
 
 ```java
   /**
@@ -508,6 +548,15 @@ Each of these methods reads one column by name and gives it a meaningful Java na
   }
 
   /**
+   * Returns the seconds since the server's status last changed ({@code lastchg}).
+   *
+   * @return the seconds, or zero for a row without a status
+   */
+  public long secondsSinceChange() {
+    return number("lastchg");
+  }
+
+  /**
    * Returns the server's current weight ({@code weight}), which slow start raises step by step.
    *
    * @return the weight
@@ -518,6 +567,8 @@ Each of these methods reads one column by name and gives it a meaningful Java na
 ```
 
 The number columns: `currentSessions()` reads `scur`, `retries()` reads `wretr`, `redispatches()` reads `wredis`, `totalSessions()` reads `stot`, `weight()` reads `weight`, and `checkStatus()` reads the text of `check_status`. The Javadoc says what each one means in HAProxy's management guide.
+
+`secondsSinceChange()` reads `lastchg`, which the management guide describes as the number of seconds since the last transition between up and down. HAProxy leaves the cell empty for a frontend's summary row (the test capture shows it), and the method then returns zero, as the Javadoc says. No main program calls it; the stack tests (`StackTest`) use it together with `isFullyUp()` to wait until every instance has been fully up for longer than slow start, so a test starts on a settled stack.
 
 ```java
   private String text(String column) {
@@ -533,8 +584,7 @@ The number columns: `currentSessions()` reads `scur`, `retries()` reads `wretr`,
       return Long.parseLong(cell);
     } catch (NumberFormatException notANumber) {
       throw new IllegalStateException(
-          "the show stat column " + column + " is not a number: " + Objects.toString(cell),
-          notANumber);
+          "the show stat column " + column + " is not a number: " + cell, notANumber);
     }
   }
 }
@@ -542,7 +592,7 @@ The number columns: `currentSessions()` reads `scur`, `retries()` reads `wretr`,
 
 `text` returns the cell, or an empty string when the column is not there. `getOrDefault` is the map method for that.
 
-`number` turns a cell into a `long` (a whole number that can be very large). An empty cell is zero: HAProxy leaves a cell empty when it does not count that thing for that row. `Long.parseLong` throws `NumberFormatException` for text such as `many`. The code catches it and throws `IllegalStateException` with the column name and the bad cell, so the message says what was wrong. The `Objects.toString(cell)` call does nothing here, because `cell` is already a `String`; it is a leftover that changes no behavior.
+`number` turns a cell into a `long` (a whole number that can be very large). An empty cell is zero: HAProxy leaves a cell empty when it does not count that thing for that row. `Long.parseLong` throws `NumberFormatException` for text such as `many`. The code catches it and throws `IllegalStateException` with the column name and the bad cell, so the message says what was wrong. The original exception is passed as the second argument, the **cause**, so a stack trace shows both. (Version 1.0.0 wrapped the cell in `Objects.toString(cell)`, a call that did nothing because `cell` is already a `String`; it is gone, and so is the import of `Objects`.)
 
 ### `haproxy/StatTable.java`
 
@@ -671,18 +721,22 @@ Run these in the repository folder. Gradle needs a JDK 25 and downloads nothing 
 
 ```text
 RuntimeApiTest > setsAServerStateAndAcceptsTheEmptyAnswer() PASSED
+RuntimeApiTest > refusesTheShortAndPaddedFormsOfAnEntry() PASSED
 RuntimeApiTest > refusesAZeroTimeout() PASSED
 RuntimeApiTest > readsBalancersFromSettingsAndNamesABadEntry() PASSED
 RuntimeApiTest > reportsHaproxysRefusal() PASSED
 RuntimeApiTest > sendsOneCommandAndReadsTheWholeAnswer() PASSED
 RuntimeApiTest > refusesAnythingThatWouldAddASecondCommand() PASSED
 StatTableTest > findsTheBackendSummaryRow() PASSED
+StatTableTest > callsOnlyAPlainUpFullyUp() PASSED
 StatTableTest > readsTheServersOfABackendByColumnName() PASSED
 StatTableTest > refusesAnAnswerThatIsNotAStatTable() PASSED
 StatTableTest > reportsAColumnThatIsNotANumber() PASSED
 StatTableTest > readsAnEmptyNumberAsZero() PASSED
 BUILD SUCCESSFUL in 1s
 ```
+
+The package has 13 tests: 7 in `RuntimeApiTest` and 6 in `StatTableTest`. The time on the last line differs on every run.
 
 **2. Look at the real answer the tests use.** `cut -d, -f1,2,18` keeps columns 1, 2 and 18 of the CSV, which are `pxname`, `svname` and `status`.
 
@@ -710,22 +764,21 @@ import io.plainround.seatwave.balancer.haproxy.*;
 System.out.println(RuntimeCommand.setState("seatwave", "seatwave-2", RuntimeCommand.AdminState.DRAIN).line());
 try { RuntimeCommand.setState("seatwave\nshow", "s1", RuntimeCommand.AdminState.MAINT); } catch (IllegalArgumentException e) { System.out.println(e.getMessage()); }
 var table = StatTable.parse(java.nio.file.Files.readString(java.nio.file.Path.of("src/test/resources/show-stat-lb2.csv")));
-table.servers("seatwave").forEach(r -> System.out.println(r.server() + " " + r.status() + " " + r.checkStatus() + " weight " + r.weight() + " scur " + r.currentSessions()));
+table.servers("seatwave").forEach(r -> System.out.println(r.server() + " " + r.status() + " " + r.checkStatus() + " weight " + r.weight() + " scur " + r.currentSessions() + " fully up " + r.isFullyUp() + " lastchg " + r.secondsSinceChange()));
 System.out.println(table.backendSummary("seatwave").get().status());
 EOF
 ```
 
 ```text
 set server seatwave/seatwave-2 state drain
-backend must match [A-Za-z0-9_-]{1,64}: seatwave
-show
-seatwave-1 UP L7OK weight 1 scur 0
-seatwave-2 UP * L7OK weight 1 scur 0
-seatwave-3 UP L7OK weight 1 scur 0
+backend must match [A-Za-z0-9_-]{1,64}, but was "seatwave\u000ashow"
+seatwave-1 UP L7OK weight 1 scur 0 fully up true lastchg 190
+seatwave-2 UP * L7OK weight 1 scur 0 fully up true lastchg 70
+seatwave-3 UP L7OK weight 1 scur 0 fully up true lastchg 190
 UP
 ```
 
-The second line shows the refusal: the name with a newline in it never becomes a command. The printed message contains that newline, which is why the word `show` appears on a line of its own. The `*` in `UP * L7OK` is how HAProxy marks a check that was running at the moment of the capture.
+The second line shows the refusal: the name with a newline in it never becomes a command. The message stays on one line, because `visible` wrote the newline as `\u000a` (version 1.0.0 printed the raw newline, and the word `show` appeared on a line of its own). Each server line shows `fully up true`, since every status in this capture is exactly `UP`, and `lastchg`: the seconds since its last change when the capture was taken. The `*` in `UP * L7OK` belongs to the check status, `* L7OK`, and is how HAProxy marks a check that was running at the moment of the capture.
 
 **4. Break a check on purpose.** In a scratch copy of the repository, change the line `if (!NAME.matcher(name).matches()) {` in `RuntimeCommand.java` to `if (false) {` and run the first command again. `refusesAnythingThatWouldAddASecondCommand` fails (I ran this change in a scratch copy). Undo the change afterwards.
 
@@ -734,7 +787,7 @@ The second line shows the refusal: the name with a newline in it never becomes a
 - **Building a command by gluing text together.** A name from a file or a user can carry a newline or a semicolon and become a second command. This repository builds commands only through `RuntimeCommand`, which checks every part, and tests that a name with a newline is refused.
 - **Counting columns by position.** HAProxy has added columns between versions. This package finds columns by the names in the header line.
 - **Forgetting the trailing comma.** Without `split(",", -1)`, Java throws away the last empty cell and the cell count differs between header and rows.
-- **Treating `UP 1/3` as down.** It is up, one failed check away from `DOWN`. `isUp()` follows HAProxy: the balancer still sends it requests.
+- **Treating `UP 1/3` as down, or as healthy.** It is up, one failed check away from `DOWN`. `isUp()` follows HAProxy: the balancer still sends it requests. `isFullyUp()` asks the stricter question a deploy needs: is it exactly `UP`, with no failed check counted?
 - **Waiting forever on a dead balancer.** Both the connect and the read have a timeout. The harness depends on that: a killed balancer must show up as "unreachable", not as a hang.
 - **Leaving the runtime API open.** This lab opens it at `admin` level on every address of the lab network, and the comment in `haproxy.cfg` says so. In production it belongs on a management network or a UNIX socket.
 

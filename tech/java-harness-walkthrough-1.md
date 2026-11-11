@@ -24,7 +24,7 @@ The package has seven files. This part covers four of them:
 
 ## Why this repository uses it
 
-Module 10 makes measurable claims: a kill behind active health checks costs thousands of failed requests and about 12 seconds; the same kill behind the production backend costs none and about 13 milliseconds; a rolling deploy costs none; killing the active balancer leaves a gap of a few seconds. A claim needs a measurement that anyone can repeat. The harness is that measurement. The README prints its output for each lab, and `measuring-a-balancer.md` explains how to read it.
+Module 10 makes measurable claims: a kill behind active health checks costs thousands of failed requests and about 11 seconds; the same kill behind the production backend costs none and about 50 milliseconds; a rolling deploy costs none; killing the active balancer leaves a gap of a few seconds. A claim needs a measurement that anyone can repeat. The harness is that measurement. The README prints its output for each lab, and `measuring-a-balancer.md` explains how to read it.
 
 Three rules shape the package:
 
@@ -269,15 +269,17 @@ package io.plainround.seatwave.balancer.harness;
 import com.github.sviperll.result4j.Result;
 import io.plainround.seatwave.balancer.config.SettingsReader;
 import io.plainround.seatwave.balancer.haproxy.NamedBalancer;
+import java.net.InetAddress;
 import java.net.URI;
 import java.time.Duration;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 ```
 
-The imports. `URI` is a web address as an object. `Optional` and `Result` were explained above.
+The imports. `URI` is a web address as an object. `InetAddress` is an internet address as an object; it is used to check the target's address. `Matcher` holds the result of applying a `Pattern` to a text, including the parts the pattern marked. `Optional` and `Result` were explained above.
 
 ```java
 /**
@@ -328,8 +330,10 @@ The record has fifteen fields, one per setting. The Javadoc explains each. Four 
 
 ```java
   private static final Pattern LABEL = Pattern.compile("[a-z0-9-]{1,32}");
-  // Only plain HTTP to an address literal of the lab network or this machine.
-  private static final Pattern TARGET = Pattern.compile("http://[0-9.]{7,15}:[0-9]{1,5}");
+  // Only plain HTTP to a dotted IPv4 literal of the lab network or this machine, with a port from 1
+  // to 65,535 written without a leading zero; the address is checked again once it is parsed.
+  private static final Pattern TARGET = Pattern.compile("http://([0-9.]{7,15}):([1-9][0-9]{0,4})");
+  private static final int HIGHEST_PORT = 65_535;
   private static final Pattern NAME = Pattern.compile("[A-Za-z0-9_-]{1,64}");
   private static final Pattern ENTRY = Pattern.compile("[a-z0-9=.:-]{1,64}");
   private static final String NO_VICTIM = "none";
@@ -346,7 +350,8 @@ The record has fifteen fields, one per setting. The Javadoc explains each. Four 
 Each setting is limited before any request is sent.
 
 - `LABEL` is one to 32 characters out of lowercase letters, digits and `-`. The label starts the report and is part of every Idempotency-Key the run sends.
-- `TARGET` is `http://`, then 7 to 15 characters of digits and dots, then `:` and one to five digits. Only plain HTTP, and only an address of digits: the comment says so. A host name cannot be given, so the harness cannot be pointed at a name by mistake.
+- `TARGET` is `http://`, then 7 to 15 characters of digits and dots, then `:` and a port of one to five digits whose first digit is 1 to 9 (`[1-9][0-9]{0,4}`), so a port of 0 or one with a leading zero, such as `09999`, does not match. Only plain HTTP, and only an address of digits: the comment says so. A host name cannot be given, so the harness cannot be pointed at a name by mistake. The round brackets mark two groups, the address and the port, which `isExactTarget` below reads; the comment says the address is checked again once it is parsed.
+- `HIGHEST_PORT` is 65,535, the largest port number.
 - `NAME` is for backend and instance names. `ENTRY` is for the list items of `watch.balancers`.
 - The numbers are limits: at most 20,000 requests per second (Module 1's peak was 13,333 holds and 20,000 seat maps per second), at most 10,000 in flight, runs of up to ten minutes, timeouts up to a minute, a watch interval of at least 10 ms, and a seed up to 1,000,000.
 
@@ -385,8 +390,12 @@ The compact constructor makes an unchangeable copy of the balancer list and reje
     Duration duration = reader.millisBetween("load.durationMillis", 1, MAX_DURATION_MILLIS);
     int holdPercent = reader.intBetween("load.holdPercent", 0, PERCENT);
     int maxInFlight = reader.intBetween("load.maxInFlight", 1, MAX_IN_FLIGHT);
+    int problemsBeforeTimeouts = reader.problems().size();
     Duration connect = reader.millisBetween("load.connectTimeoutMillis", 1, MAX_TIMEOUT_MILLIS);
     Duration request = reader.millisBetween("load.requestTimeoutMillis", 1, MAX_TIMEOUT_MILLIS);
+    // The rule between the two keys is checked only when both were read, so a missing key gives
+    // one problem line, not a second one about the stand-in values.
+    boolean timeoutsRead = reader.problems().size() == problemsBeforeTimeouts;
     int seed = reader.intBetween("load.seed", 0, MAX_SEED);
     List<String> entries = reader.listMatching("watch.balancers", ENTRY);
     String backend = reader.textMatching("watch.backend", NAME);
@@ -394,7 +403,13 @@ The compact constructor makes an unchangeable copy of the balancer list and reje
         reader.millisBetween("watch.intervalMillis", MIN_WATCH_MILLIS, MAX_TIMEOUT_MILLIS);
     String victim = reader.textMatching("report.victim", NAME);
     Duration step = reader.millisBetween("report.timelineMillis", 1, MAX_DURATION_MILLIS);
-    if (request.compareTo(connect) <= 0) {
+    if (!target.isEmpty() && !isExactTarget(target)) {
+      reader.addProblem(
+          "target.url must be http:// with a dotted IPv4 address and a port from 1 to 65535, such"
+              + " as http://10.210.10.21:8080, but was "
+              + target);
+    }
+    if (timeoutsRead && request.compareTo(connect) <= 0) {
       reader.addProblem(
           "load.requestTimeoutMillis must be longer than load.connectTimeoutMillis, or no request"
               + " that needs a new connection can finish");
@@ -434,7 +449,8 @@ The compact constructor makes an unchangeable copy of the balancer list and reje
 `from` reads one value per key and collects problems. Look at a real settings file to see the keys. This is the pair lab:
 
 ```properties
-# Lab 3: load to the floating address while lb1 is killed.
+# Lab 3: load to the floating address while the balancer that holds it is killed (scripts/lab.sh
+# pair reads which one holds it first).
 run.label=pair
 target.url=http://10.210.10.100:8080
 load.ratePerSecond=3000
@@ -451,6 +467,7 @@ load.requestTimeoutMillis=5000
 load.maxInFlight=4000
 load.seed=41
 watch.intervalMillis=100
+report.timelineMillis=1000
 ```
 
 - `run.label`, `target.url`: the name, and the address that requests go to. Here `10.210.10.100:8080` is the **floating address** that moves between the two balancers; the kill labs use `10.210.10.21` (`lb1`) with port 8080 (production backend) or 8082 (active checks only).
@@ -458,19 +475,44 @@ watch.intervalMillis=100
 - `load.holdPercent=50`: half of the requests are `POST /v1/holds` (make a hold), the other half read a hold made earlier.
 - `watch.balancers=lb1=10.210.10.21:9999,lb2=10.210.10.22:9999`: the two runtime APIs, as the harness sees them from inside the lab network (the harness container runs there, so it uses port 9999 directly, not the published host ports used by the deploy).
 - `watch.backend=seatwave`: which backend's servers to watch.
-- `report.victim=none`: the pair lab kills a balancer, not an instance, so there is no victim instance. `kill-production.properties` has `report.victim=seatwave-2`.
+- `report.victim=none`: the pair lab kills a balancer, not an instance, so there is no victim instance. The first comment of the file says which balancer: the one that holds the floating address, which `scripts/lab.sh pair` reads before it kills. `kill-production.properties` has `report.victim=seatwave-2`.
 - `load.connectTimeoutMillis=1000` and `load.requestTimeoutMillis=5000`: the timeouts of a fan's app: one second to connect, five for the whole request.
 - `load.maxInFlight=4000`, `load.seed=41`, `watch.intervalMillis=100`, `report.timelineMillis=1000`: the in-flight limit, the seat sequence start, the watch interval and the width of one row of the timeline.
 
 The code calls `reader.textMatching`, `reader.intBetween`, `reader.millisBetween` and `reader.listMatching` once per key. Each records a problem for a missing or invalid value instead of stopping, so the user sees every mistake at once.
 
-After the reads comes one cross-check: the request timeout must be longer than the connect timeout. The message says why: otherwise no request that needs a new connection can finish.
+After the reads come two cross-checks.
 
-A caveat I confirmed by running a probe in a scratch copy: when both timeouts are missing, each reader call returns the minimum, 1 ms, so the cross-check fires as well and the user gets that extra line after the two "is missing" lines. The extra line is a consequence of the missing keys, not a second mistake.
+The first is the address. The pattern `TARGET` only checks the shape, so `isExactTarget` (explained below) checks the parsed address and the port. `!target.isEmpty()` skips the check when the key was missing or did not match the pattern: `textMatching` then returned an empty string and has already recorded one problem line, and a second line about the same key would only repeat it. The message names the expected form and gives an example.
+
+The second is the timeouts: the request timeout must be longer than the connect timeout. The message says why: otherwise no request that needs a new connection can finish. This rule runs only when `timeoutsRead` is true. `problemsBeforeTimeouts` is the number of problems before the two timeout keys are read, and `timeoutsRead` compares it with the number after. If a timeout key was missing or out of range, the reader recorded a problem and returned a stand-in value (the minimum, 1 ms). Comparing two stand-in values would add a second, misleading line ("must be longer than"), so the rule is skipped and the user sees one line per real mistake. Version 1.0.0 printed that extra line.
 
 The `switch` over the `Result` of `NamedBalancer.parse` is a **pattern-matching switch**: `case Result.Success<...>(List<NamedBalancer> parsed)` matches the success case and takes the record apart so that `parsed` is the list; `case Result.Error<...>(String reason)` matches the other case and adds a problem line. The compiler checks that both cases are handled. Note `NamedBalancer.parse(entries, connect)`: the runtime API client gets the same timeout as the load's connect timeout.
 
 If there is any problem, or no balancers, the method returns `Result.error(reader.problems())`. Otherwise it builds the record. `URI.create(target)` turns the checked text into an address object, and `victim.equals(NO_VICTIM) ? "" : victim` turns the word `none` into an empty string.
+
+```java
+  private static boolean isExactTarget(String target) {
+    Matcher parts = TARGET.matcher(target);
+    if (!parts.matches() || Integer.parseInt(parts.group(2)) > HIGHEST_PORT) {
+      return false;
+    }
+    // ofLiteral also reads short forms such as 127.1; only the form that prints back the same is
+    // the address the reader meant.
+    try {
+      return InetAddress.ofLiteral(parts.group(1)).getHostAddress().equals(parts.group(1));
+    } catch (IllegalArgumentException notAnAddress) {
+      return false;
+    }
+  }
+```
+
+`isExactTarget` checks what the pattern alone cannot.
+
+- `TARGET.matcher(target)` applies the pattern again and keeps its two **groups**: the parts of the pattern in round brackets. `parts.group(1)` is the address, such as `10.210.10.21`, and `parts.group(2)` is the port, such as `8080`.
+- `Integer.parseInt(parts.group(2)) > HIGHEST_PORT` refuses a port above 65,535. The pattern allows up to five digits, so `99999` would pass it; a port is a 16-bit number, and 65,535 is the largest. Port 0 and a leading zero such as `09999` never reach this line: the pattern's `[1-9]` refuses them.
+- `InetAddress.ofLiteral(...)` (new in Java 22) turns the text into an address without asking any name server. It throws `IllegalArgumentException` when the text is not an address literal, such as `999.1.1.1`, and the `catch` turns that into `false`.
+- `ofLiteral` also accepts short forms from old network software: `127.1` means `127.0.0.1`, and `127.0.1` also reads as an address. The comment explains the fix: `getHostAddress()` prints the address back in full dotted form, and only text that prints back the same is the address the reader meant. So `127.0.1` is refused instead of quietly becoming a different address. Version 1.0.0 accepted these short and padded forms.
 
 ```java
   /**
@@ -654,9 +696,11 @@ The constructor stores its arguments after null checks.
 
 ```java
   private void readOnce() {
-    long atNanos = System.nanoTime() - startNanos;
     try {
       StatTable table = balancer.api().showStat();
+      // Stamped when the answer arrived: a status read then was true at that moment, while the
+      // moment the question was sent can be up to one read earlier than the change.
+      long atNanos = System.nanoTime() - startNanos;
       if (firstAndLast.size() < 2) {
         firstAndLast.add(table);
       } else {
@@ -667,19 +711,21 @@ The constructor stores its arguments after null checks.
         record(atNanos, balancer.name(), row.server(), row.status());
       }
     } catch (IOException silent) {
-      // A balancer that does not answer is exactly what the pair lab kills; it is a status here.
-      record(atNanos, balancer.name(), ANY_SERVER, UNREACHABLE);
+      // A balancer that does not answer is exactly what the pair lab kills; it is a status here,
+      // stamped when the read gave up.
+      record(System.nanoTime() - startNanos, balancer.name(), ANY_SERVER, UNREACHABLE);
     }
   }
 ```
 
 `readOnce` takes one reading.
 
-- `atNanos` is the time when the reading **started**, on the run's clock. A status that changed during a slow reading is therefore stamped slightly early: by up to the length of the reading, which is one connect timeout (a second) when the balancer is dead and a few milliseconds otherwise.
-- `balancer.api().showStat()` reads the table. The table is kept: the first one is added to `firstAndLast`, and later ones replace the second slot with `set(1, table)`.
+- `balancer.api().showStat()` asks the balancer for its table and waits for the answer.
+- `atNanos` is computed only **after** the answer arrived, on the run's clock. The comment says why. A status in the answer was true at the moment the answer came back. The moment the question was sent can be up to one read earlier than the change, so a stamp taken then would put the change too early. (Version 1.0.0 stamped the reading when it started; a removal could then look up to one reading earlier than it was.)
+- The table is kept: the first one is added to `firstAndLast`, and later ones replace the second slot with `set(1, table)`.
 - `record(..., ANY_SERVER, "ANSWERING")` notes that the balancer itself answered. The server named `*` stands for the balancer.
 - The loop notes the status of each server of the watched backend.
-- If the balancer does not answer (`IOException`, which covers refused connections, timeouts and a malformed answer), the watch records `UNREACHABLE` for `*`. The comment says it is a status here, because killing a balancer is what the pair lab does.
+- If the balancer does not answer (`IOException`, which covers refused connections, timeouts and a malformed answer), the watch records `UNREACHABLE` for `*`. The comment says it is a status here, because killing a balancer is what the pair lab does. That reading is stamped with `System.nanoTime() - startNanos` at the moment the read gave up, which for a dead balancer is up to one connect timeout after the question was sent.
 
 ```java
   private void record(long atNanos, String balancer, String server, String status) {
@@ -710,44 +756,75 @@ This is why the report shows only changes (for example `UP -> UP 2/3 -> UP 1/3 -
 
 Run these in the repository folder. Nothing here needs Docker. Timings differ on every run.
 
-**1. Run the tests of the package.** The harness tests start a stand-in web server and a stand-in runtime API on the loopback address. The package `harness` has 11 tests, 3 in `HarnessCliTest` and 8 in `RunReportTest`.
+**1. Run the tests of the package.** The harness tests start a stand-in web server and a stand-in runtime API on the loopback address. The package `harness` has 27 tests: 1 in `BalancerWatchTest`, 5 in `HarnessCliTest`, 7 in `LoadRunTest` and 14 in `RunReportTest`.
 
 ```bash
 ./gradlew test --tests 'io.plainround.seatwave.balancer.harness.*' --console=plain | grep -E 'PASSED|FAILED|BUILD'
 ```
 
 ```text
+BalancerWatchTest > readsOnceMoreAfterTheLoadEndedSoTheCountersIncludeItsLastRequests() PASSED
 HarnessCliTest > runsTheLoadWatchesTheBalancerAndReports() PASSED
 HarnessCliTest > namesABadBalancerEntry() PASSED
+HarnessCliTest > refusesATargetWithAShortAddressOrAPortOutOfRange() PASSED
+HarnessCliTest > reportsAMissingTimeoutOnceWithoutTheRuleThatNeedsIt() PASSED
 HarnessCliTest > refusesBadUsageAndInvalidSettings() PASSED
+LoadRunTest > sendsExactlyTheHoldShareTheSettingsAskFor() PASSED
+LoadRunTest > startsTheMeasuredPartAtTimeZeroAtARateThatDoesNotDivideASecond() PASSED
+LoadRunTest > keepsOneOutcomePerPlannedRequestWhenAReplyHoldsNoUsableHoldId() PASSED
+LoadRunTest > countsAFaultOfTheHarnessItselfAsAFailedRequest() PASSED
+LoadRunTest > asksForEverySeatOnceInTwentyThousandHoldRequests() PASSED
+LoadRunTest > countsEveryRequestToADeadTargetAsFailedWithItsReason() PASSED
+LoadRunTest > readsTheHoldsItMade() PASSED
 RunReportTest > showsTheBalancersOwnRetriesDuringTheRun() PASSED
+RunReportTest > countsAFailureSentAtTheMomentOfRemovalAsSentInBetween() PASSED
+RunReportTest > printsTheMixThatReallyRan() PASSED
+RunReportTest > readsTheMedianAndTheP99ByNearestRank() PASSED
 RunReportTest > leavesTheWarmUpOutOfEveryNumber() PASSED
 RunReportTest > findsTheLongestGapBetweenAnswersAndTheFailuresInsideIt() PASSED
 RunReportTest > ignoresARemovalBeforeTheLastAnswerAndSaysSo() PASSED
 RunReportTest > saysNoFailuresAndAllFailuresDifferently() PASSED
+RunReportTest > printsALittlesLawLineWhoseFactorsMultiplyOut() PASSED
 RunReportTest > measuresDetectionFromTheVictimsLastAnswerToItsRemoval() PASSED
+RunReportTest > takesOnlyAChangeIntoTheOutStatesAsARemoval() PASSED
+RunReportTest > countsEveryStatusBelowFiveHundredAsAnAnswerAndFromFiveHundredAsAFailure() PASSED
 RunReportTest > hasNoKillAnalysisWithoutAVictim() PASSED
 RunReportTest > countsTrafficSharePerInstanceAndPerBalancer() PASSED
-BUILD SUCCESSFUL in 7s
+BUILD SUCCESSFUL in 3s
 ```
+
+The time on the last line differs on every run.
 
 **2. A settings file with a mistake.** Make a copy in a scratch folder (`build/` is ignored by git), remove two timeouts, and run the harness. The harness reads the file, prints every problem, and exits with status 2 before it sends anything. Gradle reports that as a failed build; `head` keeps the program's own lines.
 
 ```bash
 mkdir -p build/try && grep -v 'TimeoutMillis' config/pair.properties > build/try/bad.properties
-./gradlew -q load --args='build/try/bad.properties' 2>&1 | head -n 5
+./gradlew -q load --args='build/try/bad.properties' 2>&1 | head -n 3
 ```
 
 ```text
-the settings in build/try/bad.properties have 3 problem(s):
+the settings in build/try/bad.properties have 2 problem(s):
   load.connectTimeoutMillis is missing
   load.requestTimeoutMillis is missing
-  load.requestTimeoutMillis must be longer than load.connectTimeoutMillis, or no request that needs a new connection can finish
 ```
 
-The last problem line is the cross-check from `from`, described above.
+There are two lines, one per missing key. The cross-check between the timeouts did not run, because `timeoutsRead` was false (described above).
 
-**3. A whole run on your own computer.** The `measuring-a-balancer.md` note has a small stand-in that plays three SeatWave instances and a HAProxy runtime API on the loopback address. With it you can run `./gradlew -q load --args=build/try/toy.properties` and watch the report appear, with a kill at a known moment. Its output is shown and read there.
+**3. An address in a short form.** `127.0.1` matches the pattern, since it is seven characters of digits and dots, but it is not written in full. `isExactTarget` refuses it.
+
+```bash
+sed 's#^target.url=.*#target.url=http://127.0.1:8080#' config/pair.properties > build/try/short.properties
+./gradlew -q load --args='build/try/short.properties' 2>&1 | head -n 2
+```
+
+```text
+the settings in build/try/short.properties have 1 problem(s):
+  target.url must be http:// with a dotted IPv4 address and a port from 1 to 65535, such as http://10.210.10.21:8080, but was http://127.0.1:8080
+```
+
+Change the port to `09999` and the pattern itself refuses the line, with the message `target.url must match http://([0-9.]{7,15}):([1-9][0-9]{0,4}), but was http://127.0.1:09999`. Only one line is printed, because `isExactTarget` runs only for a target the pattern accepted.
+
+**4. A whole run on your own computer.** The `measuring-a-balancer.md` note has a small stand-in that plays three SeatWave instances and a HAProxy runtime API on the loopback address. With it you can run `./gradlew -q load --args=build/try/toy.properties` and watch the report appear, with a kill at a known moment. Its output is shown and read there.
 
 ## Mistakes people make
 

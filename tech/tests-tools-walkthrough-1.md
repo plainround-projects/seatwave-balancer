@@ -1,10 +1,10 @@
 # The tests of the tools, part 1: the runtime API client and the rolling deploy
 
-This is part 1 of 2. Part 1 reads the tests of the `haproxy` package (`FakeBalancer`, `RuntimeApiTest`, `StatTableTest`) and of the `deploy` package (`RollingDeployTest`, `DeployCliTest`). Part 2 (`tests-tools-walkthrough-2.md`) reads the tests of the `harness` package (`HarnessCliTest`, `RunReportTest`).
+This is part 1 of 2. Part 1 reads the tests of the `haproxy` package (`FakeBalancer`, `RuntimeApiTest`, `StatTableTest`) and of the `deploy` package (`RollingDeployTest`, `DeployCliTest`, `DeploySettingsTest`, `DockerComposeTest`). Part 2 (`tests-tools-walkthrough-2.md`) reads the tests of the `harness` package (`HarnessCliTest`, `RunReportTest`, `LoadRunTest`, `BalancerWatchTest`) and of the `json` package (`JsonCodecTest`).
 
 ## What it is
 
-A **test** is a small program that checks that another program does what it should. It runs the code, compares the result with what you expect, and fails with a message if they differ. This repository runs its tests with **JUnit**, which finds methods marked `@Test` and runs them, and **AssertJ**, which gives readable checks such as `assertThat(x).isEqualTo(y)`. One command, `./gradlew check`, runs all tests of the project. The README says it ran 98 of them, of which the tests in this note and in `tests-tools-walkthrough-2.md` are 31: 6 in `RuntimeApiTest`, 5 in `StatTableTest`, 5 in `RollingDeployTest`, 4 in `DeployCliTest`, 3 in `HarnessCliTest` and 8 in `RunReportTest`.
+A **test** is a small program that checks that another program does what it should. It runs the code, compares the result with what you expect, and fails with a message if they differ. This repository runs its tests with **JUnit**, which finds methods marked `@Test` and runs them, and **AssertJ**, which gives readable checks such as `assertThat(x).isEqualTo(y)`. One command, `./gradlew check`, runs all tests of the project: 152 of them in version 1.1.0. This note covers 35: 7 in `RuntimeApiTest`, 6 in `StatTableTest`, 8 in `RollingDeployTest`, 7 in `DeployCliTest`, 4 in `DeploySettingsTest` and 3 in `DockerComposeTest`. Part 2 covers 34 more: 5 in `HarnessCliTest`, 14 in `RunReportTest`, 7 in `LoadRunTest`, 1 in `BalancerWatchTest` and 7 in `JsonCodecTest`.
 
 The tools in this note control two things the project does not own: HAProxy and Docker. A test cannot start a real HAProxy or a real Docker container without a full stack. So the tests use **fakes**: small stand-ins that behave like the real thing in the one way the test needs. A fake that records what it was asked, and answers with prepared text, can check that the code asks the right questions in the right order.
 
@@ -12,7 +12,7 @@ The tools in this note control two things the project does not own: HAProxy and 
 
 The deploy stops production servers. Its logic has to be right before it touches anything. The order of steps, the refusal to start when an instance is down, the refusal to stop an instance that still has sessions, the dry run that changes nothing, the question before it acts: these are rules, and each one is a test. They run in about a second and need no Docker.
 
-The tests have a second purpose that this note is honest about. Reading them with the code shows what they do **not** prove. I changed the code in a scratch copy (a technique called **mutation testing**: break a line on purpose and see if a test notices) and listed the changes that no test caught. They are in "Try it yourself" and in the walkthrough.
+The tests have a second purpose. A test is only worth something if it fails when the code is wrong. **Mutation testing** checks that: break one line on purpose (a **mutation**) and see whether a test notices. The review of version 1.0.0 found nine such changes in the tools that no test caught, for example removing the deploy's wait for "seen down". Version 1.1.0 added or strengthened a test for each, and the module's mutation check now applies 45 one-line changes across the project, each of which makes a test fail. The walkthrough says, for each new or strengthened test, which mutation it catches.
 
 ## Where it appears
 
@@ -22,7 +22,9 @@ The tests have a second purpose that this note is honest about. Reading them wit
 | `haproxy/RuntimeApiTest.java` | `RuntimeApi`, `RuntimeCommand` and `NamedBalancer`. |
 | `haproxy/StatTableTest.java` | `StatTable` and `StatRow`, with a real captured answer. |
 | `deploy/RollingDeployTest.java` | The deploy algorithm, with a scripted balancer and scripted containers. |
-| `deploy/DeployCliTest.java` | The command line: dry run, confirmation, audit, bad usage. |
+| `deploy/DeployCliTest.java` | The command line: dry run, confirmation, `--yes`, audit, an audit file that cannot be written, bad usage. |
+| `deploy/DeploySettingsTest.java` | `DeploySettings.from`: the shipped settings, the whole-seconds stop timeout, a long audit path. |
+| `deploy/DockerComposeTest.java` | `DockerCompose`, with a small shell script standing in for `docker compose`. |
 | `src/test/resources/show-stat-lb2.csv` | The real `show stat` answer the tests read. |
 
 ## How it works underneath
@@ -35,7 +37,7 @@ The tests have a second purpose that this note is honest about. Reading them wit
 
 **Loopback.** The address `127.0.0.1` always means "this computer". A program that listens on it can be reached only from the same machine. The port number 0 means "any free port, you choose", so tests do not collide.
 
-**What the tests do not do.** They never start Docker, never start HAProxy, and never call a real clock for the audit file (the audit test uses a fixed clock). The class `DockerCompose` has no test at all.
+**What the tests do not do.** They never start Docker, never start HAProxy, and never call a real clock for the audit file (the audit test uses a fixed clock). The class `DockerCompose`, which runs `docker compose` as a separate program, is tested with a stand-in: a two-line shell script that `DockerComposeTest` writes into a temporary folder and that `DockerCompose` runs in place of `docker compose`. The script records its arguments, or fails, or prints a lot, as each test needs.
 
 **Two kinds of check that matter here.** A check of *what* happened (the result is `Success(2)`) and a check of *the order* (`containsSubsequence`: these items occur in this order, with anything allowed between them).
 
@@ -268,11 +270,13 @@ The third test makes the fake answer `No such server.` and checks that `setState
     assertThatThrownBy(
             () -> RuntimeCommand.setState("seatwave\nshow", "s1", RuntimeCommand.AdminState.MAINT))
         .isInstanceOf(IllegalArgumentException.class)
-        .hasMessageContaining("backend");
+        .hasMessage("backend must match [A-Za-z0-9_-]{1,64}, but was \"seatwave\\u000ashow\"");
   }
 ```
 
-The fourth test is the security rule. A command with a semicolon is refused by the constructor. A backend name with a newline in it is refused by `setState`, with a message that mentions `backend`. Both must throw `IllegalArgumentException`. In a scratch copy I removed the name check, and I removed the semicolon check; this test failed each time (it caught both mutations).
+The fourth test is the security rule. A command with a semicolon is refused by the constructor: HAProxy's runtime API reads `;` as "a second command follows", so `show stat; shutdown sessions` would run two commands. A backend name with a newline in it is refused by `setState`. Both must throw `IllegalArgumentException`.
+
+Since 1.1.0 the second check pins the whole message: `backend must match [A-Za-z0-9_-]{1,64}, but was "seatwave\u000ashow"`. The allowed shape of a name is 1 to 64 letters, digits, underscores or hyphens. The interesting part is `\u000a`: the newline inside the name is printed as its code (hexadecimal 0a is the newline character) instead of as a real line break. A real line break would split the error message into two lines, and the second line, `show"`, could be mistaken for a message of its own. In the Java text of the test, `\\u000a` is written with two backslashes so that the expected string holds a backslash and the letters, not a newline. In a scratch copy I removed the name check, and I removed the semicolon check; this test failed each time.
 
 ```java
   @Test
@@ -303,10 +307,37 @@ The fifth test checks that a zero timeout is refused. `new InetSocketAddress(1)`
     assertThat(notAddress)
         .isEqualTo(Result.error("'lb1=999.210.10.21:9999' does not hold an IP address"));
   }
-}
 ```
 
 The sixth test is about `NamedBalancer.parse`. It parses a good list, a port that is too large (99999), and an address that is not an address (999.210.10.21), and checks the result of each. `isInstanceOf(Result.Success.class)` checks the type of the good result. `isEqualTo(Result.error("..."))` compares with the exact error: a record has `equals`, so two errors with the same text are equal. The exact messages are part of the contract: the user reads them.
+
+```java
+  @Test
+  void refusesTheShortAndPaddedFormsOfAnEntry() {
+    String shortForm = "lb1=127.0.1:9999";
+    String paddedPort = "lb1=127.0.0.1:09999";
+    String portZero = "lb1=127.0.0.1:0";
+
+    assertThat(NamedBalancer.parse(List.of(shortForm), Duration.ofSeconds(1)))
+        .isEqualTo(
+            Result.error(
+                "'lb1=127.0.1:9999' does not hold a dotted IPv4 address with four parts and no"
+                    + " padding"));
+    assertThat(NamedBalancer.parse(List.of(paddedPort), Duration.ofSeconds(1)))
+        .isInstanceOf(Result.Error.class);
+    assertThat(NamedBalancer.parse(List.of(portZero), Duration.ofSeconds(1)))
+        .isInstanceOf(Result.Error.class);
+  }
+}
+```
+
+The seventh test, new in 1.1.0, covers three entries that look almost right.
+
+- `lb1=127.0.1:9999` has an address with three parts. Java's `InetAddress.ofLiteral` accepts it: an old convention reads `127.0.1` as `127.0.0.1`. So the address the program would use is not the one the reader of the settings file sees. `NamedBalancer.parse` now prints the parsed address back with `getHostAddress()` and refuses the entry when the text differs. The exact message is pinned: `'lb1=127.0.1:9999' does not hold a dotted IPv4 address with four parts and no padding`. The message is split over two Java strings joined with `+`, only to keep the source line short.
+- `lb1=127.0.0.1:09999` has a **padded** port: a leading zero. The entry pattern now requires a port that starts with a digit from 1 to 9 (`[1-9][0-9]{0,4}`), so this is an error.
+- `lb1=127.0.0.1:0` has port 0, which no server can listen on for a client to reach (0 only asks the system to pick a free port). The same pattern refuses it.
+
+For the last two only the type of the result (`Result.Error`) is checked, not the message. The mutation check confirms both halves: accepting a short address (`if (false)` in place of the comparison) and accepting port 0 (the old pattern `[0-9]{1,5}`) each make this test fail.
 
 What the file does not test: an answer larger than a megabyte, a read timeout, a refused connection, and the states `READY` and `MAINT`.
 
@@ -385,6 +416,27 @@ The third test parses a tiny hand-made table. `"# pxname,svname,scur,status,\nb,
 
 ```java
   @Test
+  void callsOnlyAPlainUpFullyUp() throws IOException {
+    StatTable table =
+        StatTable.parse("# pxname,svname,status,\nb,s1,UP,\nb,s2,UP 2/3,\nb,s3,DOWN 1/2,\n");
+
+    assertThat(table.server("b", "s1").orElseThrow().isFullyUp()).isTrue();
+    assertThat(table.server("b", "s2").orElseThrow().isFullyUp()).isFalse();
+    assertThat(table.server("b", "s2").orElseThrow().isUp()).isTrue();
+    assertThat(table.server("b", "s3").orElseThrow().isFullyUp()).isFalse();
+  }
+```
+
+The fourth test, new in 1.1.0, is about the difference between "up" and "fully up". HAProxy writes a server's status with a counter while checks are changing it: `UP 2/3` means "up, but one check has just failed; two more failures and it goes down". `DOWN 1/2` means "down, one good check of the two needed to come back". The tiny table has three rows: `s1` plain `UP`, `s2` `UP 2/3`, `s3` `DOWN 1/2`.
+
+- `isFullyUp()` is true only for the plain `UP` of `s1`.
+- `s2` is not fully up, but `isUp()` is still true for it: `isUp` only looks at the first word.
+- `s3` is not fully up.
+
+The deploy uses `isFullyUp` before it changes anything (see `changesNothingWhenAnInstanceIsAlreadyFailingItsChecks` below), because an instance at `UP 1/3` is already failing.
+
+```java
+  @Test
   void refusesAnAnswerThatIsNotAStatTable() {
     assertThatThrownBy(() -> StatTable.parse("Unknown command: 'show stats'\n"))
         .isInstanceOf(IOException.class)
@@ -395,7 +447,7 @@ The third test parses a tiny hand-made table. `"# pxname,svname,scur,status,\nb,
   }
 ```
 
-The fourth test passes text that is not a table. `Unknown command: 'show stats'` gives an `IOException` mentioning the text; an empty string gives one mentioning `an empty answer`.
+The fifth test passes text that is not a table. `Unknown command: 'show stats'` gives an `IOException` mentioning the text; an empty string gives one mentioning `an empty answer`.
 
 ```java
   @Test
@@ -410,7 +462,7 @@ The fourth test passes text that is not a table. `Unknown command: 'show stats'`
 }
 ```
 
-The fifth test builds a row whose `scur` is `many`. Reading `currentSessions` must throw `IllegalStateException` with the column name. `row::currentSessions` is a method reference passed to `assertThatThrownBy`, so the call happens inside the check.
+The sixth test builds a row whose `scur` is `many`. Reading `currentSessions` must throw `IllegalStateException` with the column name. `row::currentSessions` is a method reference passed to `assertThatThrownBy`, so the call happens inside the check.
 
 ### `deploy/RollingDeployTest.java`
 
@@ -471,7 +523,67 @@ Two instances and two backends are used, not three, to keep the tests short. `ca
   }
 ```
 
-The first test restarts both instances with two balancers. It checks that the result is `Success(2)` and then that the recorded calls contain, **in this order**, these calls: drain `seatwave-1` on `lb1` in the first backend, drain it on `lb2` in the second, stop `seatwave-1`, start it, set it ready on both balancers, then drain `seatwave-2` and stop it. `containsSubsequence` allows other calls between the listed ones. It does not check that sessions or the down status were waited for.
+**`restartsEachInstanceInOrderOnEveryBalancer`** restarts both instances with two balancers. It checks that the result is `Success(2)` and then that the recorded calls contain, **in this order**, these calls: drain `seatwave-1` on `lb1` in the first backend, drain it on `lb2` in the second, stop `seatwave-1`, start it, set it ready on both balancers, then drain `seatwave-2` and stop it. `containsSubsequence` allows other calls between the listed ones. The waits between the steps are checked by the next two tests.
+
+```java
+  @Test
+  void startsAnInstanceOnlyAfterEveryBalancerHasSeenItDown() throws InterruptedException {
+    // The checks take three readings to notice the stop, as real checks take seconds.
+    world.readsUntilSeenDown = 3;
+
+    Result<Integer, String> result = deploy(List.of(world.balancer("lb1"), world.balancer("lb2")));
+
+    assertThat(result).isEqualTo(Result.success(2));
+    assertThat(calls).contains("start seatwave-1 while DOWN", "start seatwave-2 while DOWN");
+    assertThat(calls).noneMatch(call -> call.startsWith("start") && call.endsWith("while UP"));
+  }
+```
+
+**`startsAnInstanceOnlyAfterEveryBalancerHasSeenItDown`.** New in 1.1.0. After `docker stop`, a real balancer needs a few seconds of failed checks before its table says `DOWN`. The deploy must wait for that before it starts the instance again. If it started too soon, the balancer might never notice the restart and would send full traffic at once to a cold instance, skipping slow start.
+
+- `world.readsUntilSeenDown = 3` makes the scripted balancers slow: after a stop, the instance keeps its old status for two readings of the table and shows `DOWN` from the third on (the mechanism is in `World` below).
+- The deploy with two balancers must still succeed (`Success(2)`).
+- The scripted `start` records a second line naming the status at the moment of the start, such as `start seatwave-1 while DOWN`. Both instances must have been started while `DOWN`.
+- `noneMatch(...)` checks that no recorded call both starts with `start` and ends with `while UP`: no start happened while the balancer still saw the old instance up.
+
+In version 1.0.0 the scripted `stop` set `DOWN` at once, so removing the wait passed every test. The mutation check now replaces the wait's condition with `false`, and this test fails.
+
+```java
+  @Test
+  void waitsTheSettleTimeBeforeTheNextInstance() throws InterruptedException {
+    Duration settle = Duration.ofMillis(300);
+
+    Result<Integer, String> result = deploy(List.of(world.balancer("lb1")), settle);
+
+    assertThat(result).isEqualTo(Result.success(2));
+    // A lower bound only: a sleep is never shorter than asked, however busy the machine is.
+    assertThat(world.secondDrainNanos - world.firstReadyNanos)
+        .isGreaterThanOrEqualTo(settle.toNanos());
+  }
+```
+
+**`waitsTheSettleTimeBeforeTheNextInstance`.** New in 1.1.0. The **settle time** is a pause after one instance is fully up and before the next one is drained, so slow start can bring the first one to full weight. The test runs a deploy with a settle of 300 ms.
+
+- The scripted balancer notes the moment `seatwave-1` is set `READY` (`firstReadyNanos`) and the moment `seatwave-2` is set `DRAIN` (`secondDrainNanos`), with `System.nanoTime()`, a clock that only counts forward and is meant for measuring time spans.
+- The gap between the two must be at least 300 ms, in nanoseconds (`settle.toNanos()`).
+
+The comment explains why only a lower bound is checked: `Thread.sleep` never wakes up early, but a busy machine can make it wake up late. An upper bound would make the test fail at random on a loaded machine. The mutation check replaces `Thread.sleep(settings.settle())` with `Thread.sleep(Duration.ZERO)`, and this test fails.
+
+```java
+  @Test
+  void changesNothingWhenAnInstanceIsAlreadyFailingItsChecks() throws InterruptedException {
+    world.status.put("seatwave/seatwave-2", "UP 1/3");
+
+    Result<Integer, String> result = deploy(List.of(world.balancer("lb1")));
+
+    assertThat(result)
+        .isEqualTo(
+            Result.error("check before: lb1 sees seatwave/seatwave-2 UP 1/3; nothing was changed"));
+    assertThat(calls).isEmpty();
+  }
+```
+
+**`changesNothingWhenAnInstanceIsAlreadyFailingItsChecks`.** New in 1.1.0. `seatwave-2` is reported as `UP 1/3`: still up, but one failed check away from trouble. Restarting the others while it is weak could leave too few instances. The deploy must refuse with the exact error `check before: lb1 sees seatwave/seatwave-2 UP 1/3; nothing was changed`, and `calls` must be empty. The deploy's check before now asks for `isFullyUp()` (only a plain `UP`), not `isUp()` (any status that starts with `UP`). The mutation check puts `isUp()` back, and this test fails.
 
 ```java
   @Test
@@ -487,7 +599,7 @@ The first test restarts both instances with two balancers. It checks that the re
   }
 ```
 
-The second test sets `seatwave/seatwave-2` to `DOWN` before the deploy. The result must be exactly the error `check before: lb1 sees seatwave/seatwave-2 DOWN; nothing was changed`, and `calls` must be empty: no command was sent at all. This is the "refuse to start from a broken state" rule.
+**`changesNothingWhenAnInstanceIsNotUpBeforehand`** sets `seatwave/seatwave-2` to `DOWN` before the deploy. The result must be exactly the error `check before: lb1 sees seatwave/seatwave-2 DOWN; nothing was changed`, and `calls` must be empty: no command was sent at all. This is the "refuse to start from a broken state" rule.
 
 ```java
   @Test
@@ -501,7 +613,7 @@ The second test sets `seatwave/seatwave-2` to `DOWN` before the deploy. The resu
   }
 ```
 
-The third test makes the sessions stay open (`scur` is 3 forever). The deploy must give up with an error and must never call `stop seatwave-1`. This is the "never stop an instance with running requests" rule. It takes the drain timeout of 200 ms to fail.
+**`stopsWhenTheDrainedInstanceKeepsItsSessions`** makes the sessions stay open (`scur` is 3 forever). The deploy must give up with an error and must never call `stop seatwave-1`. This is the "never stop an instance with running requests" rule. It takes the drain timeout of 200 ms to fail.
 
 ```java
   @Test
@@ -517,7 +629,7 @@ The third test makes the sessions stay open (`scur` is 3 forever). The deploy mu
   }
 ```
 
-The fourth test makes the balancer throw `IOException`. The error is exactly `check before: lb1 does not answer: the test balancer is off; nothing was changed`.
+**`stopsWhenTheBalancerDoesNotAnswer`** makes the balancer throw `IOException`. The error is exactly `check before: lb1 does not answer: the test balancer is off; nothing was changed`.
 
 ```java
   @Test
@@ -530,13 +642,18 @@ The fourth test makes the balancer throw `IOException`. The error is exactly `ch
   }
 ```
 
-The fifth test makes the restarted instance stay `DOWN` after `start`. The deploy must fail with `seatwave-1 did not pass its checks within PT0.2S`. `PT0.2S` is how Java prints a `Duration` of 200 ms (ISO 8601: P for period, T for time, 0.2 seconds).
+**`stopsWhenTheRestartedInstanceNeverComesUp`** makes the restarted instance stay `DOWN` after `start`. The deploy must fail with `seatwave-1 did not pass its checks within PT0.2S`. `PT0.2S` is how Java prints a `Duration` of 200 ms (ISO 8601: P for period, T for time, 0.2 seconds).
 
 ```java
   private Result<Integer, String> deploy(List<BalancerControl> balancers)
       throws InterruptedException {
+    return deploy(balancers, Duration.ZERO);
+  }
+
+  private Result<Integer, String> deploy(List<BalancerControl> balancers, Duration settle)
+      throws InterruptedException {
     return new RollingDeploy(
-            settings(),
+            settings(settle),
             balancers,
             world.containers(),
             new PrintStream(new ByteArrayOutputStream(), true, StandardCharsets.UTF_8))
@@ -544,10 +661,10 @@ The fifth test makes the restarted instance stay `DOWN` after `start`. The deplo
   }
 ```
 
-`deploy` is a helper. It builds a `RollingDeploy` with the settings, the given balancers, the world's containers, and a `PrintStream` that writes into memory and is thrown away. Then it calls `run()`.
+`deploy` is a helper, in two forms. The first, used by most tests, calls the second with a settle of `Duration.ZERO`. Two methods with the same name and different parameters are called **overloads**; Java picks the one whose parameters fit the call. The second builds a `RollingDeploy` with the settings, the given balancers, the world's containers, and a `PrintStream` that writes into memory and is thrown away. Then it calls `run()`.
 
 ```java
-  private static DeploySettings settings() {
+  private static DeploySettings settings(Duration settle) {
     return new DeploySettings(
         "seatwave-balancer",
         INSTANCES,
@@ -556,13 +673,13 @@ The fifth test makes the restarted instance stay `DOWN` after `start`. The deplo
         Duration.ofMillis(200),
         Duration.ofSeconds(1),
         Duration.ofMillis(200),
-        Duration.ZERO,
+        settle,
         Duration.ofMillis(10),
         Path.of("build/unused-audit.log"));
   }
 ```
 
-`settings()` builds a `DeploySettings` by hand. `List.<NamedBalancer>of()` is an empty list of balancers (the scripted balancers are passed separately). The numbers: drain wait 200 ms, stop timeout 1 s, up wait 200 ms, settle zero, poll every 10 ms. Short timeouts make the failing tests quick. The audit path is not used by `RollingDeploy`.
+`settings(settle)` builds a `DeploySettings` by hand. `List.<NamedBalancer>of()` is an empty list of balancers (the scripted balancers are passed separately). The numbers: drain wait 200 ms, stop timeout 1 s, up wait 200 ms, the settle the caller gave, poll every 10 ms. Short timeouts make the failing tests quick. The audit path is not used by `RollingDeploy`.
 
 ```java
   /** The servers' status as both balancers see it, and the containers that change it. */
@@ -571,6 +688,11 @@ The fifth test makes the restarted instance stay `DOWN` after `start`. The deplo
     private volatile boolean sessionsStayOpen;
     private volatile boolean isAnswering = true;
     private volatile boolean staysDownAfterStart;
+    // Readings of the balancers after a stop before they show the instance down; 0 is at once.
+    private volatile int readsUntilSeenDown;
+    private final Map<String, Integer> readsLeft = new ConcurrentHashMap<>();
+    private volatile long firstReadyNanos;
+    private volatile long secondDrainNanos;
 
     World() {
       for (String backend : BACKENDS) {
@@ -581,7 +703,13 @@ The fifth test makes the restarted instance stay `DOWN` after `start`. The deplo
     }
 ```
 
-`World` is an inner class that holds the whole scripted state. `status` maps `backend/instance` to a status text. Three `volatile` flags switch behaviors: sessions stay open, the balancer does not answer, the instance stays down after start. The constructor puts every server of every backend in the state `UP`.
+`World` is an inner class that holds the whole scripted state. `status` maps `backend/instance` to a status text. Three `volatile` flags switch behaviors: sessions stay open, the balancer does not answer, the instance stays down after start. The fields added in 1.1.0:
+
+- `readsUntilSeenDown`: how many readings of the table a stop takes to show. The comment says it: 0 means at once, as in version 1.0.0.
+- `readsLeft`: for each stopped instance, how many readings are still to go before it shows `DOWN`. A `ConcurrentHashMap` is a map that several threads may change at the same time.
+- `firstReadyNanos` and `secondDrainNanos`: the two moments the settle test compares. They start at 0, which means "not yet seen".
+
+The constructor puts every server of every backend in the state `UP`.
 
 ```java
     BalancerControl balancer(String name) {
@@ -596,6 +724,12 @@ The fifth test makes the restarted instance stay `DOWN` after `start`. The deplo
           if (!isAnswering) {
             throw new IOException("the test balancer is off");
           }
+          readsLeft.replaceAll((service, left) -> {
+            if (left == 1) {
+              BACKENDS.forEach(backend -> status.put(backend + "/" + service, "DOWN"));
+            }
+            return Math.max(0, left - 1);
+          });
           List<StatRow> rows = new ArrayList<>();
           status.forEach((key, value) -> {
             String[] parts = key.split("/");
@@ -617,6 +751,12 @@ The fifth test makes the restarted instance stay `DOWN` after `start`. The deplo
         @Override
         public void setState(String backend, String server, AdminState state) {
           calls.add(name + " " + backend + "/" + server + " " + state);
+          if (server.equals("seatwave-1") && state == AdminState.READY && firstReadyNanos == 0) {
+            firstReadyNanos = System.nanoTime();
+          }
+          if (server.equals("seatwave-2") && state == AdminState.DRAIN && secondDrainNanos == 0) {
+            secondDrainNanos = System.nanoTime();
+          }
         }
       };
     }
@@ -624,10 +764,12 @@ The fifth test makes the restarted instance stay `DOWN` after `start`. The deplo
 
 `balancer(name)` returns an anonymous `BalancerControl`.
 
-- `stat()` throws `IOException` if the flag says the balancer is off. Otherwise it builds a `StatTable` from the map: for each entry it splits the key at the slash and makes a `StatRow` with `pxname`, `svname`, `status` and `scur` (`"3"` if sessions stay open, else `"0"`).
-- `setState` only records a call such as `lb1 seatwave/seatwave-1 DRAIN`. It does not change the status.
+- `stat()` throws `IOException` if the flag says the balancer is off.
+- Then it counts one reading for every stopped instance. `readsLeft.replaceAll(...)` replaces each value of the map with what the function returns. For an instance with one reading left, this reading is the one that notices the stop: it sets the status to `DOWN` in both backends. The new value is one less, but never below zero (`Math.max(0, left - 1)`), so a finished count stays at 0 and does nothing more. With `readsUntilSeenDown = 3`, the first two readings after a stop still show the old status and the third shows `DOWN`. The count is shared by both balancers, so a reading by either one counts.
+- It then builds a `StatTable` from the map: for each entry it splits the key at the slash and makes a `StatRow` with `pxname`, `svname`, `status` and `scur` (`"3"` if sessions stay open, else `"0"`).
+- `setState` records a call such as `lb1 seatwave/seatwave-1 DRAIN`. It does not change the status. It also notes the time of the first `READY` of `seatwave-1` and of the first `DRAIN` of `seatwave-2`; the `== 0` checks keep the first moment if the same call comes twice (it comes once per balancer and backend).
 
-That last point is the reason for a gap. The fake `DRAIN` does not turn the status into `DRAIN`, so the status in the table stays `UP`, `DOWN` or whatever the containers set.
+The fake `DRAIN` does not turn the status into `DRAIN`, so the status in the table stays `UP`, `DOWN` or whatever the containers set.
 
 ```java
     Containers containers() {
@@ -635,12 +777,17 @@ That last point is the reason for a gap. The fake `DRAIN` does not turn the stat
         @Override
         public void stop(String service) {
           calls.add("stop " + service);
-          BACKENDS.forEach(backend -> status.put(backend + "/" + service, "DOWN"));
+          if (readsUntilSeenDown == 0) {
+            BACKENDS.forEach(backend -> status.put(backend + "/" + service, "DOWN"));
+          } else {
+            readsLeft.put(service, readsUntilSeenDown);
+          }
         }
 
         @Override
         public void start(String service) {
           calls.add("start " + service);
+          calls.add("start " + service + " while " + status.get("seatwave/" + service));
           if (!staysDownAfterStart) {
             BACKENDS.forEach(backend -> status.put(backend + "/" + service, "UP"));
           }
@@ -651,9 +798,10 @@ That last point is the reason for a gap. The fake `DRAIN` does not turn the stat
 }
 ```
 
-`containers()` returns an anonymous `Containers`. `stop` records the call and sets every backend's status for that service to `DOWN` **at once**. `start` records the call and sets `UP`, unless the flag says the instance stays down.
+`containers()` returns an anonymous `Containers`.
 
-Because `stop` makes the status `DOWN` immediately, the deploy's wait for "seen down" is satisfied on its first look. No test can tell whether that wait exists. I removed it in a scratch copy (changed the condition to `false`) and all 31 tests of the three packages still passed. The same is true of the settle pause: the tests use a settle of zero. A better fake would stay `UP` for a few reads after `stop` and `DOWN` afterwards, and a test would then check that `start` came after the first `DOWN` was read.
+- `stop` records the call. With `readsUntilSeenDown` at 0 it sets every backend's status for that service to `DOWN` at once. Otherwise it only starts the countdown in `readsLeft`, and `stat()` above flips the status later.
+- `start` records the call twice: once as `start seatwave-1`, which the order test looks for, and once with the status the balancer showed at that moment, such as `start seatwave-1 while DOWN`, which the seen-down test looks for. `status.get("seatwave/" + service)` reads the status in the first backend. Then it sets `UP`, unless the flag says the instance stays down.
 
 ### `deploy/DeployCliTest.java`
 
@@ -666,6 +814,7 @@ import io.plainround.seatwave.balancer.haproxy.FakeBalancer;
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.io.OutputStream;
 import java.io.PrintStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -674,12 +823,13 @@ import java.time.Clock;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.util.List;
+import java.util.Properties;
 import java.util.concurrent.CopyOnWriteArrayList;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 ```
 
-The imports. `Clock`, `Instant` and `ZoneOffset` make a clock that always shows the same moment. `@TempDir` is from JUnit.
+The imports. `Clock`, `Instant` and `ZoneOffset` make a clock that always shows the same moment. `@TempDir` is from JUnit. `OutputStream` and `Properties` are new in 1.1.0: the settings file is now written by `Properties.store` (the helper `settings` below).
 
 ```java
 class DeployCliTest {
@@ -695,9 +845,12 @@ class DeployCliTest {
   private final List<String> containerCalls = new CopyOnWriteArrayList<>();
   // What the fake balancer reports for seatwave-1; the fake containers change it.
   private String[] containerStatus = {"UP"};
+  private Runnable onStop = () -> {};
 ```
 
-`CLOCK` is fixed at `2026-11-11T09:00:00Z`, so the audit line has a known time. `HEADER` is a one-line `show stat` header with four columns. `@TempDir Path folder` makes JUnit create a fresh temporary folder for each test and delete it afterwards: the settings file and the audit file go there, not into the repository. `out` and `err` collect what the program prints. `containerCalls` records the container calls. `containerStatus` is a one-item array shared with the fake balancer in one test; an array is used because a lambda may share the array but cannot change a plain variable.
+`CLOCK` is fixed at `2026-11-11T09:00:00Z`, so the audit line has a known time. `HEADER` is a one-line `show stat` header with four columns. `@TempDir Path folder` makes JUnit create a fresh temporary folder for each test and delete it afterwards: the settings file and the audit file go there, not into the repository. `out` and `err` collect what the program prints. `containerCalls` records the container calls. `containerStatus` is a one-item array shared with the fake balancer in some tests; an array is used because a lambda may share the array but cannot change a plain variable.
+
+`onStop` is new in 1.1.0. A `Runnable` is a piece of code with no input and no result. `() -> {}` is one that does nothing. The fake containers run it inside `stop`, so a test can make something happen at that exact moment of the deploy (one test makes the audit file read-only there).
 
 ```java
   @Test
@@ -765,13 +918,83 @@ This is the most complete test of the package: socket, parsing, algorithm and au
 
 ```java
   @Test
+  void deploysWithoutAQuestionWhenGivenYes() throws IOException {
+    String[] status = {"UP"};
+    try (FakeBalancer balancer = deployingBalancer(status)) {
+      containerStatus = status;
+
+      int code = run(settings(balancer, folder.resolve("audit.log")), "", "--run", "--yes");
+
+      assertThat(code).isZero();
+      assertThat(text(out)).doesNotContain("Go ahead?").contains("deploy finished: 1 instances");
+      assertThat(containerCalls).containsExactly("stop seatwave-1", "start seatwave-1");
+    }
+  }
+```
+
+**`deploysWithoutAQuestionWhenGivenYes`.** New in 1.1.0. `--yes` answers the question in advance, for a script that runs the deploy without a person at the keyboard. The input is empty (`""`): if the program asked anyway, it would read nothing and refuse. The checks: exit status 0, the printed text never contains `Go ahead?` and does contain `deploy finished: 1 instances`, and the containers were stopped and started. `deployingBalancer(status)` is the helper below: the same fake balancer as in the third test.
+
+```java
+  @Test
+  void saysTheDeployFinishedWhenOnlyTheLastAuditLineFails() throws IOException {
+    String[] status = {"UP"};
+    Path audit = folder.resolve("audit.log");
+    try (FakeBalancer balancer = deployingBalancer(status)) {
+      containerStatus = status;
+      // The audit file turns read-only after the first line, while the instance restarts.
+      onStop = () -> audit.toFile().setReadOnly();
+
+      int code = run(settings(balancer, audit), "", "--run", "--yes");
+
+      assertThat(code).isEqualTo(DeployCli.EXIT_FAILED);
+      assertThat(text(out)).contains("deploy finished: 1 instances restarted, all up");
+      assertThat(text(err))
+          .contains("the audit line of this deploy cannot be written")
+          .contains("the deploy itself finished as printed above")
+          .doesNotContain("deploy stopped");
+    }
+  }
+```
+
+**`saysTheDeployFinishedWhenOnlyTheLastAuditLineFails`.** New in 1.1.0. The audit file gets two lines: one before the deploy starts and one after it ends. This test makes the second one fail and checks what the program says.
+
+- `onStop = () -> audit.toFile().setReadOnly()` runs while the instance is being stopped, after the first audit line was written. `toFile()` turns the `Path` into the older `File` type, which has `setReadOnly()`: from then on the file can be read but not written.
+- The deploy itself succeeds, so the printed text says `deploy finished: 1 instances restarted, all up`.
+- Writing the last line fails, and a guardrail that failed must not end with status 0, so the exit status is `EXIT_FAILED`.
+- The error text must say `the audit line of this deploy cannot be written` and `the deploy itself finished as printed above`, and must not contain `deploy stopped`.
+
+The defect it guards against: in version 1.0.0 a failure of the last audit line printed "deploy stopped" after a deploy that had finished, which tells the operator the opposite of the truth. The mutation check makes the message always say `stopped`, and this test fails. One limit: `setReadOnly` does not stop the superuser (`root`), who may write any file. Run as `root`, for example inside some containers, the write would succeed and this test would fail for that reason.
+
+```java
+  @Test
+  void startsNothingWhenTheFirstAuditLineCannotBeWritten() throws IOException {
+    String[] status = {"UP"};
+    // A folder where the audit file should be: no line can be appended to it.
+    Path audit = Files.createDirectories(folder.resolve("audit-folder.log"));
+    try (FakeBalancer balancer = deployingBalancer(status)) {
+      containerStatus = status;
+
+      int code = run(settings(balancer, audit), "", "--run", "--yes");
+
+      assertThat(code).isEqualTo(DeployCli.EXIT_FAILED);
+      assertThat(text(err)).contains("deploy not started", "nothing changed");
+      assertThat(containerCalls).isEmpty();
+      assertThat(balancer.commands()).isEmpty();
+    }
+  }
+```
+
+**`startsNothingWhenTheFirstAuditLineCannotBeWritten`.** New in 1.1.0. Here the very first audit line fails. `Files.createDirectories(folder.resolve("audit-folder.log"))` makes a **folder** with the name the audit file should have. A program cannot append a line to a folder, so the write fails, whoever runs the test. The deploy must not start: exit status `EXIT_FAILED`, the error text contains `deploy not started` and `nothing changed`, no container call was made, and the fake balancer received no command at all (not even `show stat`). The rule: a deploy that cannot leave a record does not run.
+
+```java
+  @Test
   void refusesBadUsage() {
     assertThat(run(Path.of("x"), "", "--now")).isEqualTo(DeployCli.EXIT_BAD_USAGE);
     assertThat(text(err)).contains("usage: deploy");
   }
 ```
 
-The fourth test gives an unknown flag, `--now`, and expects exit status 2 and a `usage: deploy` message. The settings path `x` does not exist and is never read, because the arguments are checked first.
+`refusesBadUsage` gives an unknown flag, `--now`, and expects exit status 2 and a `usage: deploy` message. The settings path `x` does not exist and is never read, because the arguments are checked first.
 
 ```java
   private int run(Path settings, String input, String... flags) {
@@ -789,6 +1012,7 @@ The fourth test gives an unknown flag, `--now`, and expects exit status 2 and a 
               @Override
               public void stop(String service) {
                 containerCalls.add("stop " + service);
+                onStop.run();
                 containerStatus[0] = "DOWN";
               }
 
@@ -801,30 +1025,48 @@ The fourth test gives an unknown flag, `--now`, and expects exit status 2 and a 
   }
 ```
 
-`run` is the helper. It builds the argument array from the settings path and the flags with `System.arraycopy`, feeds the text as standard input, collects the two output streams as UTF-8 text, gives the fixed clock, and gives a container factory written as a lambda that returns an anonymous `Containers`. The anonymous class records `stop` and `start` and flips `containerStatus[0]`.
+`run` is the helper. It builds the argument array from the settings path and the flags with `System.arraycopy`, feeds the text as standard input, collects the two output streams as UTF-8 text, gives the fixed clock, and gives a container factory written as a lambda that returns an anonymous `Containers`. The anonymous class records `stop` and `start` and flips `containerStatus[0]`. Inside `stop` it runs `onStop` after recording the call and before the status turns `DOWN`.
 
 ```java
   private Path settings(FakeBalancer balancer) throws IOException {
-    return Files.writeString(
-        folder.resolve("deploy.properties"),
-        String.join(
-            "\n",
-            "compose.project=seatwave-balancer",
-            "deploy.instances=seatwave-1",
-            "deploy.backends=seatwave",
-            "deploy.balancers=lb1=127.0.0.1:" + balancer.port(),
-            "deploy.drainTimeoutMillis=1000",
-            "deploy.stopTimeoutMillis=1000",
-            "deploy.upTimeoutMillis=1000",
-            "deploy.settleMillis=0",
-            "deploy.pollMillis=10",
-            "deploy.auditFile=" + folder.resolve("audit.log"),
-            ""),
-        StandardCharsets.UTF_8);
+    return settings(balancer, folder.resolve("audit.log"));
+  }
+
+  private Path settings(FakeBalancer balancer, Path audit) throws IOException {
+    Properties properties = new Properties();
+    properties.setProperty("compose.project", "seatwave-balancer");
+    properties.setProperty("deploy.instances", "seatwave-1");
+    properties.setProperty("deploy.backends", "seatwave");
+    properties.setProperty("deploy.balancers", "lb1=127.0.0.1:" + balancer.port());
+    properties.setProperty("deploy.drainTimeoutMillis", "1000");
+    properties.setProperty("deploy.stopTimeoutMillis", "1000");
+    properties.setProperty("deploy.upTimeoutMillis", "1000");
+    properties.setProperty("deploy.settleMillis", "0");
+    properties.setProperty("deploy.pollMillis", "10");
+    // Written by Properties.store, which escapes a backslash, so a Windows path reads back whole.
+    properties.setProperty("deploy.auditFile", audit.toString());
+    Path file = folder.resolve("deploy.properties");
+    try (OutputStream stream = Files.newOutputStream(file)) {
+      properties.store(stream, "test");
+    }
+    return file;
   }
 ```
 
-`settings` writes a `deploy.properties` file into the temporary folder: the project name, one instance, one backend, one balancer on the fake's port, 1-second timeouts, no settle, a 10-ms poll, and an audit file in the same folder. It joins the lines with newlines. `Files.writeString` writes and returns the path. One portability note: `folder.resolve("audit.log")` is written into a `.properties` file as plain text. On Windows its backslashes would be read as escape characters. The tests as written assume a path with forward slashes.
+`settings` writes a `deploy.properties` file into the temporary folder, in two overloads: one with the audit file `audit.log` in the same folder, and one that takes the audit path. The values: the project name, one instance, one backend, one balancer on the fake's port, 1-second timeouts, no settle, a 10-ms poll, and the audit path.
+
+In version 1.0.0 the file was built by joining text lines, so the audit path was written as plain text. On Windows a path such as `C:\Users\...` holds backslashes, and a properties file reads a backslash as the start of an escape, so the path would come back broken. Now the values go into a `Properties` object and `properties.store(stream, "test")` writes the file. `store` escapes every backslash (it writes `\\`), and it writes `test` as a comment line at the top, with the date. The comment in the code says why. `Files.newOutputStream(file)` opens the file for writing; the `try ( ... )` block closes it.
+
+```java
+  private static FakeBalancer deployingBalancer(String[] status) throws IOException {
+    return new FakeBalancer(command ->
+        command.startsWith("set server")
+            ? "\n"
+            : HEADER + "seatwave,seatwave-1,0," + status[0] + ",\n");
+  }
+```
+
+`deployingBalancer(status)` builds the fake balancer of the deploying tests in one expression. `condition ? a : b` is Java's **conditional operator**: `a` if the condition holds, otherwise `b`. A `set server` command gets an empty line; anything else gets the header and one row for `seatwave-1` with the status in `status[0]`.
 
 ```java
   private static String text(ByteArrayOutputStream stream) {
@@ -835,7 +1077,208 @@ The fourth test gives an unknown flag, `--now`, and expects exit status 2 and a 
 
 `text` turns the collected bytes into a string.
 
-What `DeployCliTest` does not cover, as the coverage report of my scratch copy shows: the flag `--yes`, a deploy that stops with an error (exit status 1 and the audit line `deploy: stopped`), invalid settings (exit status 2), an audit file that cannot be written, an interrupted deploy, and `main` itself.
+What `DeployCliTest` still does not cover: a deploy that stops with an error (exit status 1 and the audit line `deploy: stopped`), invalid settings (exit status 2), an interrupted deploy, and `main` itself.
+
+### `deploy/DeploySettingsTest.java`
+
+New in 1.1.0. `DeploySettings.from(reader)` turns a settings file into a checked `DeploySettings`, or into a list of problem lines. These four tests read it directly.
+
+```java
+package io.plainround.seatwave.balancer.deploy;
+
+import static org.assertj.core.api.Assertions.assertThat;
+
+import com.github.sviperll.result4j.Result;
+import io.plainround.seatwave.balancer.config.SettingsReader;
+import java.io.IOException;
+import java.nio.file.Path;
+import java.util.List;
+import java.util.Properties;
+import org.junit.jupiter.api.Test;
+
+class DeploySettingsTest {
+```
+
+The imports. `SettingsReader` is the project's reader of settings files (`tests-config-walkthrough.md` reads its tests). `Properties` is Java's in-memory form of a settings file.
+
+```java
+  @Test
+  void readsTheDeploySettingsShippedWithTheProject() throws IOException {
+    Result<DeploySettings, List<String>> read =
+        DeploySettings.from(
+            new SettingsReader(SettingsReader.load(Path.of("config/deploy.properties"))));
+
+    assertThat(read).isInstanceOf(Result.Success.class);
+  }
+```
+
+**`readsTheDeploySettingsShippedWithTheProject`.** Loads the real `config/deploy.properties` of the repository and checks that it is valid (`Result.Success`). A shipped file that the program refuses would stop every deploy; this test catches that in the build.
+
+```java
+  @Test
+  void refusesAStopTimeoutDockerWouldRoundToZeroSeconds() {
+    Properties properties = valid();
+    properties.setProperty("deploy.stopTimeoutMillis", "999");
+
+    Result<DeploySettings, List<String>> read = DeploySettings.from(new SettingsReader(properties));
+
+    assertThat(read)
+        .isEqualTo(
+            Result.error(
+                List.of(
+                    "deploy.stopTimeoutMillis must be at least 1000: docker counts whole seconds")));
+  }
+```
+
+**`refusesAStopTimeoutDockerWouldRoundToZeroSeconds`.** `docker compose stop -t` takes whole seconds. `DockerCompose` passes `stopTimeout.toSeconds()`, which drops the fraction, so 999 ms would become `-t 0`: Docker would kill the instance at once instead of letting it drain. The test starts from valid settings, sets `deploy.stopTimeoutMillis` to 999, and requires exactly one problem: `deploy.stopTimeoutMillis must be at least 1000: docker counts whole seconds`. The mutation check removes the rule (`if (false)`), and this test fails.
+
+```java
+  @Test
+  void reportsAMissingStopTimeoutOnceWithoutTheRuleThatNeedsIt() {
+    Properties properties = valid();
+    properties.remove("deploy.stopTimeoutMillis");
+
+    Result<DeploySettings, List<String>> read = DeploySettings.from(new SettingsReader(properties));
+
+    assertThat(read).isEqualTo(Result.error(List.of("deploy.stopTimeoutMillis is missing")));
+  }
+```
+
+**`reportsAMissingStopTimeoutOnceWithoutTheRuleThatNeedsIt`.** The other side of the same rule. With the key removed, the reader already reports `deploy.stopTimeoutMillis is missing`. The whole-seconds rule must then not run: the missing value reads as zero, and the rule would add a second, misleading line ("must be at least 1000") about a value nobody wrote. `isEqualTo(Result.error(List.of(...)))` requires exactly the one line. The code counts the problems before and after reading the key and checks the rule only when no problem was added (`stopRead`). The mutation check drops that condition, and this test fails.
+
+```java
+  @Test
+  void acceptsAnAuditFileInADeepFolderWithSpaces() {
+    Properties properties = valid();
+    properties.setProperty(
+        "deploy.auditFile", "/checkouts/My Labs/" + "nested-folder/".repeat(20) + "audit.log");
+
+    Result<DeploySettings, List<String>> read = DeploySettings.from(new SettingsReader(properties));
+
+    assertThat(read).isInstanceOf(Result.Success.class);
+  }
+```
+
+**`acceptsAnAuditFileInADeepFolderWithSpaces`.** The audit path is read with `filePath`, which allows any characters except control characters, up to 4,096 of them. A path with a space and twenty nested folders must be accepted.
+
+```java
+  private static Properties valid() {
+    Properties properties = new Properties();
+    properties.setProperty("compose.project", "seatwave-balancer");
+    properties.setProperty("deploy.instances", "seatwave-1,seatwave-2");
+    properties.setProperty("deploy.backends", "seatwave");
+    properties.setProperty("deploy.balancers", "lb1=127.0.0.1:21005");
+    properties.setProperty("deploy.drainTimeoutMillis", "1000");
+    properties.setProperty("deploy.stopTimeoutMillis", "30000");
+    properties.setProperty("deploy.upTimeoutMillis", "1000");
+    properties.setProperty("deploy.settleMillis", "0");
+    properties.setProperty("deploy.pollMillis", "10");
+    properties.setProperty("deploy.auditFile", "build/stack/audit.log");
+    return properties;
+  }
+}
+```
+
+`valid()` builds a complete, valid set of deploy settings in memory: two instances, one backend, one balancer, timeouts, and an audit file. Each test changes one key of it, so a failure points at that key. The stop timeout is 30,000 ms, the shipped file's value, which its comment explains: longer than the instance's 20 s drain deadline, so Docker never kills a draining instance.
+
+### `deploy/DockerComposeTest.java`
+
+New in 1.1.0. `DockerCompose` starts `docker compose` as a separate **process** (a running program of its own, with its own memory) and waits for it. To test it without Docker, the class takes the program to run as a list; the real code passes `docker compose`, and the tests pass `sh` and a script.
+
+```java
+package io.plainround.seatwave.balancer.deploy;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.time.Duration;
+import java.util.List;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
+
+/**
+ * DockerCompose with a stand-in program in place of {@code docker compose}: a small shell script
+ * that writes its arguments to a file, so the tests see the exact command line, and can fail or
+ * print a lot on purpose. Needs a POSIX shell, as the project's scripts do.
+ */
+class DockerComposeTest {
+
+  @TempDir Path folder;
+```
+
+The class comment says what the stand-in is: "a small shell script that writes its arguments to a file, so the tests see the exact command line". A **shell script** is a text file of commands for `sh`, the standard command interpreter of Unix-like systems. "Needs a POSIX shell, as the project's scripts do": the tests run on macOS and Linux, not on plain Windows. The comment names what the tests make the script do: write its arguments, fail, or print a lot. None of the three tests makes it hang, so the time-limit branches of `DockerCompose` (`did not finish within`, `did not end within`) are not tested.
+
+```java
+  @Test
+  void stopsWithDockersWholeSecondTimeoutAndStartsByServiceName() throws Exception {
+    Path calls = folder.resolve("calls.txt");
+    DockerCompose compose =
+        compose("printf '%s\\n' \"$*\" >> \"" + calls + "\"", Duration.ofMillis(30_500));
+
+    compose.stop("seatwave-2");
+    compose.start("seatwave-2");
+
+    assertThat(Files.readAllLines(calls, StandardCharsets.UTF_8))
+        .containsExactly(
+            "-p seatwave-balancer stop -t 30 seatwave-2", "-p seatwave-balancer start seatwave-2");
+  }
+```
+
+**`stopsWithDockersWholeSecondTimeoutAndStartsByServiceName`.** The script body is `printf '%s\n' "$*" >> "<calls.txt>"`. In the shell, `$*` is all the script's arguments joined by spaces, `printf '%s\n'` prints them followed by a line break, and `>>` appends that line to the file. (In the Java text, `\\n` and `\"` are a backslash-n and a double quote.) The stop timeout is 30,500 ms.
+
+After `stop("seatwave-2")` and `start("seatwave-2")`, the file must hold exactly two lines:
+
+- `-p seatwave-balancer stop -t 30 seatwave-2`: the project, the action, the timeout in whole seconds (30.5 s rounds down to 30), and the service;
+- `-p seatwave-balancer start seatwave-2`.
+
+This pins the exact command line Docker would get. Each argument is passed separately, never as one shell string, so a service name cannot smuggle in a second command.
+
+```java
+  @Test
+  void reportsAFailedCommandWithItsExitStatusAndOutput() throws Exception {
+    DockerCompose compose = compose("echo 'no such service' >&2; exit 3", Duration.ofSeconds(1));
+
+    assertThatThrownBy(() -> compose.start("seatwave-9"))
+        .isInstanceOf(IOException.class)
+        .hasMessageEndingWith("start seatwave-9 exited 3: no such service");
+  }
+```
+
+**`reportsAFailedCommandWithItsExitStatusAndOutput`.** The script prints `no such service` to the error stream (`>&2`) and exits with status 3. `start("seatwave-9")` must throw an `IOException` whose message ends with `start seatwave-9 exited 3: no such service`: the action, the exit status and what the program printed. `DockerCompose` merges the error stream into the normal output (`redirectErrorStream(true)`), so the message includes it.
+
+```java
+  @Test
+  void readsALargeOutputWhileTheCommandRuns() throws Exception {
+    // About 1 MB, far more than a pipe holds: a child that cannot write would never end.
+    DockerCompose compose =
+        compose(
+            "i=0; while [ $i -lt 20000 ]; do echo " + "x".repeat(50) + "; i=$((i+1)); done; exit 1",
+            Duration.ofSeconds(1));
+
+    assertThatThrownBy(() -> compose.start("seatwave-1"))
+        .isInstanceOf(IOException.class)
+        .hasMessageContaining("exited 1");
+  }
+```
+
+**`readsALargeOutputWhileTheCommandRuns`.** A **pipe** connects the child's output to the parent. It holds only a small amount of text (usually 64 KiB or less); when it is full, the child stops at its next write until the parent reads. A parent that waits for the child to end before it reads anything therefore waits forever for a child that prints a lot. The script here prints 20,000 lines of 50 `x` characters, about 1 MB, then exits 1. The loop is written in shell: `i=0`, then `while [ $i -lt 20000 ]` (while `i` is less than 20,000), `echo` the line, and `i=$((i+1))` adds one.
+
+The test expects the `IOException` with `exited 1`. That only happens if `DockerCompose` reads the output while the child runs. In version 1.0.0 it read the output only after the wait, so this script would never end, and the wait would give up after the 30 s margin with `did not finish within`. Now a second thread (`FutureTask` on a virtual thread) reads as the child writes.
+
+```java
+  private DockerCompose compose(String body, Duration stopTimeout) throws IOException {
+    Path program = folder.resolve("docker-stand-in.sh");
+    Files.writeString(program, "#!/bin/sh\n" + body + "\n", StandardCharsets.UTF_8);
+    return new DockerCompose(List.of("sh", program.toString()), "seatwave-balancer", stopTimeout);
+  }
+}
+```
+
+`compose(body, stopTimeout)` writes the stand-in script: `#!/bin/sh` (the **shebang** line, which names the interpreter), the body, and a line break, into `docker-stand-in.sh` in the temporary folder. It returns a `DockerCompose` that runs `sh <script>` in place of `docker compose`, for the project `seatwave-balancer`. The script is passed to `sh` as an argument, so it needs no execute permission.
 
 ## Try it yourself
 
@@ -848,57 +1291,77 @@ Run these in the repository folder. Nothing needs Docker. Timings differ on ever
 ```
 
 ```text
+DeployCliTest > saysTheDeployFinishedWhenOnlyTheLastAuditLineFails() PASSED
 DeployCliTest > printsThePlanAndChangesNothingByDefault() PASSED
 DeployCliTest > changesNothingWithoutAYes() PASSED
+DeployCliTest > deploysWithoutAQuestionWhenGivenYes() PASSED
 DeployCliTest > refusesBadUsage() PASSED
 DeployCliTest > deploysAfterConfirmationAndWritesTheAudit() PASSED
+DeployCliTest > startsNothingWhenTheFirstAuditLineCannotBeWritten() PASSED
+DeploySettingsTest > refusesAStopTimeoutDockerWouldRoundToZeroSeconds() PASSED
+DeploySettingsTest > readsTheDeploySettingsShippedWithTheProject() PASSED
+DeploySettingsTest > reportsAMissingStopTimeoutOnceWithoutTheRuleThatNeedsIt() PASSED
+DeploySettingsTest > acceptsAnAuditFileInADeepFolderWithSpaces() PASSED
+DockerComposeTest > readsALargeOutputWhileTheCommandRuns() PASSED
+DockerComposeTest > stopsWithDockersWholeSecondTimeoutAndStartsByServiceName() PASSED
+DockerComposeTest > reportsAFailedCommandWithItsExitStatusAndOutput() PASSED
 RollingDeployTest > stopsWhenTheBalancerDoesNotAnswer() PASSED
 RollingDeployTest > stopsWhenTheRestartedInstanceNeverComesUp() PASSED
 RollingDeployTest > restartsEachInstanceInOrderOnEveryBalancer() PASSED
+RollingDeployTest > changesNothingWhenAnInstanceIsAlreadyFailingItsChecks() PASSED
 RollingDeployTest > changesNothingWhenAnInstanceIsNotUpBeforehand() PASSED
+RollingDeployTest > waitsTheSettleTimeBeforeTheNextInstance() PASSED
+RollingDeployTest > startsAnInstanceOnlyAfterEveryBalancerHasSeenItDown() PASSED
 RollingDeployTest > stopsWhenTheDrainedInstanceKeepsItsSessions() PASSED
 RuntimeApiTest > setsAServerStateAndAcceptsTheEmptyAnswer() PASSED
+RuntimeApiTest > refusesTheShortAndPaddedFormsOfAnEntry() PASSED
 RuntimeApiTest > refusesAZeroTimeout() PASSED
 RuntimeApiTest > readsBalancersFromSettingsAndNamesABadEntry() PASSED
 RuntimeApiTest > reportsHaproxysRefusal() PASSED
 RuntimeApiTest > sendsOneCommandAndReadsTheWholeAnswer() PASSED
 RuntimeApiTest > refusesAnythingThatWouldAddASecondCommand() PASSED
 StatTableTest > findsTheBackendSummaryRow() PASSED
+StatTableTest > callsOnlyAPlainUpFullyUp() PASSED
 StatTableTest > readsTheServersOfABackendByColumnName() PASSED
 StatTableTest > refusesAnAnswerThatIsNotAStatTable() PASSED
 StatTableTest > reportsAColumnThatIsNotANumber() PASSED
 StatTableTest > readsAnEmptyNumberAsZero() PASSED
-BUILD SUCCESSFUL in 1s
+BUILD SUCCESSFUL in 2s
 ```
 
-That is 11 tests of the `haproxy` package and 9 of the `deploy` package.
+That is 13 tests of the `haproxy` package and 22 of the `deploy` package. Add `cleanTest` before `test` if Gradle says the task is up to date. The order of the lines can differ.
 
-**2. Break the order and watch a test fail.** In a scratch copy of the repository, open `RollingDeploy.java` and delete the line `setEverywhere(instance, AdminState.READY);`. Run command 1 again. `restartsEachInstanceInOrderOnEveryBalancer` fails, because the calls `READY` are missing from the recorded list. (I ran this change.) Undo it.
+**2. Break the order and watch a test fail.** In a scratch copy of the repository, open `RollingDeploy.java` and delete the line `setEverywhere(instance, AdminState.READY);`. Run command 1 again. `restartsEachInstanceInOrderOnEveryBalancer` fails, because the calls `READY` are missing from the recorded list. Undo it.
 
-**3. Find what no test notices.** In the same scratch copy, change `Thread.sleep(settings.settle());` to `Thread.sleep(0);`. All tests pass (I ran this change): the settle time is never checked. Undo it.
+**3. Break a wait and watch the new tests notice.** In the same scratch copy, change `Thread.sleep(settings.settle());` to `Thread.sleep(0);` and run only `--tests '*RollingDeployTest'`. `waitsTheSettleTimeBeforeTheNextInstance() FAILED` appears. Undo it, then change the line `if (!waitFor(instance, row -> row.status().startsWith("DOWN"), settings.upTimeout())) {` to `if (false) {`. `startsAnInstanceOnlyAfterEveryBalancerHasSeenItDown() FAILED` appears. Undo it. (I ran both changes; in version 1.0.0 both passed every test.)
 
-**4. See the mutations I ran.** I changed one line at a time in a scratch copy and ran the tests of the three packages. These changes were caught by a test: removing the `READY` call, removing the session wait, accepting any answer to the question `Go ahead?`, accepting a removal before the last answer, ignoring the HAProxy refusal text, `isUp` as an exact match, setting states on one balancer only, removing the name check, allowing a semicolon in a command, keeping the warm-up requests. These were **not** caught: removing the wait for "seen down", ignoring the settle time, a strict instead of inclusive bound in the failed-in-between count, flooring the percentile rank, a removal counted when the server was already out, `<=` in the hold mix, removing the stop-timeout rule of the settings, removing the last watch reading, and counting every 4xx as a failure.
+**4. Read the mutation list.** The module's mutation check changes one line at a time in a copy and runs the named tests. Among its 45 changes, these are caught by the tests of this note: the seen-down wait removed, the settle ignored, the stop-timeout rule removed, the stop-timeout rule run on a missing value, a short address accepted, port 0 accepted, the check before counting `UP 1/3` as up, and an audit failure that says "stopped" after a finished deploy. Each line of its output ends `a test FAILED (good)`.
 
 ## Mistakes people make
 
-- **A fake that is too eager.** `FakeBalancer` and the scripted world are simple on purpose, but the scripted `stop` sets `DOWN` at once, so the test cannot tell whether the code waits. A fake should be as slow as the real thing in the way the test is about.
+- **A fake that is too eager.** In version 1.0.0 the scripted `stop` set `DOWN` at once, so no test could tell whether the deploy waited. A fake should be as slow as the real thing in the way the test is about; `readsUntilSeenDown` is that slowness.
 - **Checking only the result.** A deploy that restarts in the wrong order can still return `Success`. The first test checks the order of calls.
+- **An upper bound on a sleep.** A sleep can last longer on a busy machine. The settle test checks only that it lasted at least the settle time.
 - **Real clocks in tests.** The audit time is checked against a fixed clock, so the test does not depend on the date.
 - **Tests that write into the repository.** `@TempDir` gives every test its own folder and removes it.
-- **Waiting with `sleep` for something to happen.** These tests use short timeouts of the code under test (200 ms) and a polling loop of 10 ms, which are bounded. The README says the whole suite ran 40 times in a row beside 8 busy loops with no failure.
+- **Writing a settings file by joining text.** A backslash in a value becomes an escape. `Properties.store` escapes it.
+- **Reading a child's output only after it ends.** The pipe fills and both sides wait forever. `readsALargeOutputWhileTheCommandRuns` guards against it.
+- **Waiting with `sleep` for something to happen.** These tests use short timeouts of the code under test (200 ms) and a polling loop of 10 ms, which are bounded. The module's test loop ran the whole test task 40 times beside 8 busy loops on the 12 cores with 0 failures.
 - **Leaving a server running.** Every `FakeBalancer` is opened in a `try` block, so its socket is closed even when a check fails.
 
 ## Check yourself
 
 1. What does `containsSubsequence` check that `contains` does not? *Answer: The items occur in the given order, with anything allowed between them.*
 2. Why does `FakeBalancer` listen on port 0? *Answer: The system picks a free port, so tests running at the same time never collide.*
-3. Which rule does `changesNothingWhenAnInstanceIsNotUpBeforehand` prove? *Answer: The deploy refuses to start when an instance is not up, and sends no command before it refuses.*
-4. Why can no test notice that the deploy stops waiting for "seen down"? *Answer: The scripted `stop` sets the status to `DOWN` at once, so the wait is satisfied immediately whether it exists or not.*
-5. What does `@TempDir` give a test? *Answer: A fresh temporary folder that JUnit deletes afterwards.*
+3. Which rule does `changesNothingWhenAnInstanceIsAlreadyFailingItsChecks` prove? *Answer: The deploy refuses to start when an instance is not fully up (`UP 1/3` counts as not fully up), and sends no command before it refuses.*
+4. How does the scripted world let a test see whether the deploy waits for "seen down"? *Answer: With `readsUntilSeenDown = 3` a stop shows only on the third reading of the table, and `start` records the status it saw; a start `while UP` means the deploy did not wait.*
+5. Why does `DockerComposeTest` print about 1 MB from its stand-in script? *Answer: Far more than a pipe holds, so the test ends only if `DockerCompose` reads the output while the child runs.*
 
 ## Further reading
 
 - JUnit User Guide (this repository pins JUnit 6.1.3): https://docs.junit.org/current/user-guide/
 - AssertJ Core documentation, 3.27: https://assertj.github.io/doc/
-- Java SE 25 API: `java.net.ServerSocket`, `java.time.Clock`, `java.util.concurrent.CopyOnWriteArrayList`: https://docs.oracle.com/en/java/javase/25/docs/api/
+- Java SE 25 API: `java.net.ServerSocket`, `java.time.Clock`, `java.util.concurrent.CopyOnWriteArrayList`, `java.lang.ProcessBuilder`, `java.util.Properties.store`: https://docs.oracle.com/en/java/javase/25/docs/api/
 - HAProxy 3.4 Management Guide (the answers the fake imitates): https://docs.haproxy.org/3.4/management.html
+- Docker Compose CLI reference, `docker compose stop` (the `-t` timeout in seconds): https://docs.docker.com/reference/cli/docker/compose/stop/
+- POSIX shell command language (`$*`, `printf`, `>>`): https://pubs.opengroup.org/onlinepubs/9799919799/utilities/V3_chap02.html

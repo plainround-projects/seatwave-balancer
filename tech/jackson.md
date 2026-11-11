@@ -29,7 +29,7 @@ SeatWave's API takes a JSON body to hold a seat and answers in JSON. The instanc
 | `src/main/java/.../seatwave/HoldRoutes.java`, `Problems.java` | Call `json.read` and `json.write`; they never import Jackson (`java-config-json-walkthrough.md`). |
 | `src/main/java/.../harness/LoadRun.java` | Calls `json.read` on the body of a granted hold to remember its id. |
 
-I searched `src` for `com.fasterxml`: only `JsonCodec.java` imports it, with 16 import lines. No test imports Jackson, and no test file is named for the codec: the tests reach it through the routes and the load run (the coverage report shows that the refusal branches of `read` are never run, `jacoco.md`).
+I searched `src` for `com.fasterxml`: only `JsonCodec.java` imports it, with 17 import lines. No test imports Jackson. `JsonCodecTest` tests the codec through its own methods, `read` and `write`, and pins every reason it gives; in the coverage report (`jacoco.md`) 6 of the 63 lines of `JsonCodec` are never run, the branches for failures no test body can cause.
 
 ## How it works underneath
 
@@ -37,7 +37,7 @@ I searched `src` for `com.fasterxml`: only `JsonCodec.java` imports it, with 16 
 2. To read, the mapper asks a `JsonParser` for tokens (`START_OBJECT`, a field name, a number, `END_OBJECT`). It looks at the target type, here a Java **record**, finds the record's constructor, and calls it with the values it read. A record needs no annotations: its component names are the field names.
 3. To write, the mapper looks at a record or a list or a map, and writes its components in the order the record declares them. `Problems.ProblemBody` says so in a comment: "record components are written in this order".
 4. Everything is in memory. Jackson makes no network call and reads no file.
-5. Every failure is an exception. The codec catches the ones a client can cause and turns each into a `Result.error` (`result4j.md`). The base class of all of them is `JacksonException`; `JsonMappingException` is the one for "the JSON is fine but does not fit the type", `MismatchedInputException` is a wrong type, and `UnrecognizedPropertyException` is a field the type does not have.
+5. Every failure is an exception. The codec catches the ones a client can cause and turns each into a `Result.error` (`result4j.md`). The base class of all of them is `JacksonException`; `JsonMappingException` is the one for "the JSON is fine but does not fit the type", `MismatchedInputException` is a wrong type, `UnrecognizedPropertyException` is a field the type does not have, and `StreamReadException` is a failure of the low-level reader itself (broken text, or a repeated field when duplicate detection is on).
 
 **What Jackson does by default.** A default `ObjectMapper` is forgiving. I ran a tiny program with the 2.23.0 jars. A record `Hold(long eventId, String seat)` was written as `{"eventId":1,"seat":"A-1"}` and read back as `Hold[eventId=7, seat=B-2]`. The text `"7"` in place of the number 7 was **coerced** (silently converted) to 7. A field `typo` that the record does not have raised `UnrecognizedPropertyException`, because refusing unknown fields is on by default. And `"eventId":null` for the primitive `long` was read as `0`, with no error, until `FAIL_ON_NULL_FOR_PRIMITIVES` was switched on, which made it raise `MismatchedInputException`. Those are exactly the soft spots that `JsonCodec` closes.
 
@@ -52,6 +52,7 @@ import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.core.JsonToken;
 import com.fasterxml.jackson.core.StreamReadFeature;
 import com.fasterxml.jackson.core.exc.InputCoercionException;
+import com.fasterxml.jackson.core.exc.StreamReadException;
 import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.JsonMappingException;
 import com.fasterxml.jackson.databind.MapperFeature;
@@ -64,9 +65,12 @@ import com.fasterxml.jackson.databind.json.JsonMapper;
 import com.fasterxml.jackson.databind.type.LogicalType;
 import com.github.sviperll.result4j.Result;
 import java.io.IOException;
+import java.io.UncheckedIOException;
+import java.util.Objects;
+import java.util.stream.Collectors;
 ```
 
-- The first group (`com.fasterxml.jackson.core.*`) is `jackson-core`: `JacksonException` (the base of every Jackson failure), `JsonParser` and `JsonToken` (reading token by token), `JsonProcessingException` (thrown when writing fails), `StreamReadFeature` (switches of the parser), and `InputCoercionException` (a number that does not fit its type).
+- The first group (`com.fasterxml.jackson.core.*`) is `jackson-core`: `JacksonException` (the base of every Jackson failure), `JsonParser` and `JsonToken` (reading token by token), `JsonProcessingException` (thrown when writing fails), `StreamReadFeature` (switches of the parser), `InputCoercionException` (a number that does not fit its type) and `StreamReadException` (a failure of the parser while it reads the text).
 - The second group (`com.fasterxml.jackson.databind.*`) is `jackson-databind`: `DeserializationFeature` and `MapperFeature` (switches of the mapper), `JsonMappingException`, `MismatchedInputException` and `UnrecognizedPropertyException` (the exception family), `ObjectMapper` and `JsonMapper` (the mapper and its builder), and `CoercionAction`, `CoercionInputShape` and `LogicalType` (the vocabulary of the coercion rules).
 - `com.github.sviperll.result4j.Result` is the result type (`result4j.md`). The rest are JDK classes: `IOException` and `UncheckedIOException` for the one failure that cannot be the client's fault, `Objects` for the null checks and `Collectors` for the pointer helper below.
 
@@ -85,9 +89,15 @@ public final class JsonCodec {
 
   // RFC 6901: the empty pointer is the whole document.
   private static final String WHOLE_BODY = "";
+  // Jackson has no exception type of its own for a repeated field; STRICT_DUPLICATE_DETECTION
+  // reports it as a parse error with this message, so the message is the only signal. A test pins
+  // it, so a Jackson version that words it differently fails the build instead of the reason.
+  private static final String DUPLICATE_MESSAGE = "Duplicate field '";
 ```
 
-The class comment lists what is refused: "Unknown fields, nulls for numbers, a value of the wrong type, a number out of range, trailing data and duplicate fields". It promises a reason that names the field. The notes on `read` below show that two of the refusals, trailing text that is not JSON and a repeated field, give the generic reason `the body is not valid JSON` and do not name the field. `WHOLE_BODY` is the empty JSON pointer, which RFC 6901 defines as the whole document. The comment on the `final` class says it is thread-safe: the mapper is configured once and only read afterwards.
+The class comment lists what is refused: "Unknown fields, nulls for numbers, a value of the wrong type, a number out of range, trailing data and duplicate fields". It promises a reason that names the field. `WHOLE_BODY` is the empty JSON pointer, which RFC 6901 defines as the whole document.
+
+`DUPLICATE_MESSAGE` is `"Duplicate field '"`, the start of the message Jackson 2.23 writes when `STRICT_DUPLICATE_DETECTION` finds a name twice. The comment explains the choice: Jackson has no exception class of its own for that case, it throws a general parse error, so the message is the only signal. Reading a library's message is fragile, and the comment names the guard: a test (`JsonCodecTest.namesAFieldThatAppearsTwice`) expects the field's name in the answer, so a Jackson version that words the message differently fails the build instead of silently giving clients a vaguer reason. The comment on the `final` class says it is thread-safe: the mapper is configured once and only read afterwards.
 
 ```java
   private final ObjectMapper mapper =
@@ -117,9 +127,9 @@ The class comment lists what is refused: "Unknown fields, nulls for numbers, a v
 - `.disable(MapperFeature.ALLOW_COERCION_OF_SCALARS)` refuses `"1"` where a number is wanted. A **scalar** is a single value (a number, a text, a boolean). The comment says `"1" and 1.5 are not the integer the contract asks for: no silent conversion.`
 - `.disable(DeserializationFeature.ACCEPT_FLOAT_AS_INT)` refuses `1.5` where an integer is wanted instead of cutting it to `1`.
 - `.withCoercionConfig(LogicalType.Textual, textual -> textual.setCoercion(CoercionInputShape.Integer, CoercionAction.Fail)...)` is the reverse direction. A **lambda** is a short anonymous function: `textual -> ...` takes the settings object for text fields and changes it. For a field that expects **text**, an integer, a float and a boolean are each set to `CoercionAction.Fail`. The comment says: "The switch above covers numbers and booleans only; 5 or true is not a string either." So `{"seat": 5}` is refused. I fed that body to the codec and got `/seat has the wrong type`.
-- `.enable(StreamReadFeature.STRICT_DUPLICATE_DETECTION)` makes the parser refuse an object with the same field twice. By default the last one wins, which lets a client hide a value from a check that reads the first. I tested it: `{"eventId":1,"eventId":2,...}` was refused, but with the reason "the body is not valid JSON" and not one that names `eventId`.
+- `.enable(StreamReadFeature.STRICT_DUPLICATE_DETECTION)` makes the parser refuse an object with the same field twice. By default the last one wins, which lets a client hide a value from a check that reads the first. I tested it: `{"eventId":1,"eventId":2,...}` is refused with `/eventId appears more than once` (the table below).
 
-### `read`: one success, eight refusals
+### `read`: one success, nine refusals
 
 ```java
   /**
@@ -145,11 +155,9 @@ The class comment lists what is refused: "Unknown fields, nulls for numbers, a v
         return Result.error(new BindingProblem(WHOLE_BODY, "the body must be a JSON object"));
       }
       T value = mapper.readValue(parser, type);
-      if (parser.nextToken() != null) {
-        return Result.error(
-            new BindingProblem(WHOLE_BODY, "the body has data after the JSON object"));
-      }
-      return Result.success(value);
+      return hasMore(parser)
+          ? Result.error(new BindingProblem(WHOLE_BODY, "the body has data after the JSON object"))
+          : Result.success(value);
     } catch (UnrecognizedPropertyException unknownField) {
       return Result.error(
           new BindingProblem(
@@ -161,6 +169,14 @@ The class comment lists what is refused: "Unknown fields, nulls for numbers, a v
       if (unbound.getCause() instanceof InputCoercionException) {
         return Result.error(
             new BindingProblem(pointerOf(unbound), "is out of range for this field"));
+      }
+      return Result.error(new BindingProblem(WHOLE_BODY, "the body is not valid JSON"));
+    } catch (StreamReadException malformed) {
+      if (malformed.getOriginalMessage().startsWith(DUPLICATE_MESSAGE)
+          && malformed.getProcessor() != null) {
+        // The parser stopped on the repeated name, so its context is the path of that field.
+        String pointer = malformed.getProcessor().getParsingContext().pathAsPointer().toString();
+        return Result.error(new BindingProblem(pointer, "appears more than once"));
       }
       return Result.error(new BindingProblem(WHOLE_BODY, "the body is not valid JSON"));
     } catch (JacksonException malformed) {
@@ -176,25 +192,26 @@ The class comment lists what is refused: "Unknown fields, nulls for numbers, a v
 - `Objects.requireNonNull(...)` twice refuse a `null` argument. That is a programming error, so it throws.
 - The comment says the parser is driven by hand: "an empty body, a body that is not an object and data after the object each get their own message instead of one generic type error." `try (JsonParser parser = mapper.createParser(json))` opens a parser on the text; the **try-with-resources** closes it at the end.
 - `JsonToken first = parser.nextToken();` reads the first token. `null` means the text was empty. Anything but `START_OBJECT` means the body is not an object, for example `[1]`.
-- `T value = mapper.readValue(parser, type);` binds the object to the record. The next line, `parser.nextToken() != null`, asks whether anything follows the closing brace. If a token follows, the answer is "the body has data after the JSON object". If the extra text is not even a valid token (`x`), `nextToken` itself throws, and the `catch (JacksonException malformed)` block turns it into "the body is not valid JSON". That is the first case where the reason is less exact than the class comment suggests.
-- The `catch` blocks go from the most specific exception to the most general, because Java takes the first block that fits. `UnrecognizedPropertyException` becomes the pointer `"/" + escaped(unknownField.getPropertyName())` with "is not a field of this request". `MismatchedInputException` becomes "has the wrong type". Another `JsonMappingException` is checked for a cause of `InputCoercionException`, the comment's example being `99999999999999999999`, "valid JSON; it only does not fit the field's type", and becomes "is out of range for this field". Any other `JacksonException` becomes "the body is not valid JSON": a body that is cut short, and also the repeated field, which Jackson reports as a syntax error. The `IOException` block is for a failure that cannot happen when reading a `String`, and so it throws.
+- `T value = mapper.readValue(parser, type);` binds the object to the record. Then `hasMore(parser)` (shown with `write` below) asks whether anything follows the closing brace. If something does, the answer is "the body has data after the JSON object"; if not, `Result.success(value)`. `? :` picks one of the two values.
+- The `catch` blocks go from the most specific exception to the most general, because Java takes the first block that fits. `UnrecognizedPropertyException` becomes the pointer `"/" + escaped(unknownField.getPropertyName())` with "is not a field of this request". `MismatchedInputException` becomes "has the wrong type". Another `JsonMappingException` is checked for a cause of `InputCoercionException`, the comment's example being `99999999999999999999`, "valid JSON; it only does not fit the field's type", and becomes "is out of range for this field". A `StreamReadException` whose original message (`getOriginalMessage()`, the message without the location Jackson adds) starts with `DUPLICATE_MESSAGE` is the repeated field. `getProcessor()` is the parser that threw, and the code checks it is not `null` before using it. The comment explains the pointer: the parser stopped on the repeated name, so `getParsingContext().pathAsPointer()`, the parser's own position written as an RFC 6901 pointer, is the path of that field, for example `/eventId`. The answer is that pointer with "appears more than once". Any other `StreamReadException`, and any other `JacksonException`, becomes "the body is not valid JSON": a body that is cut short, for example. The `IOException` block is for a failure that cannot happen when reading a `String`, and so it throws.
 
-I fed ten bodies to `JsonCodec.read` with a three-field record (`Long eventId`, `String seat`, `String customer`) and read the `detail`:
+I fed eleven bodies to `JsonCodec.read` with a three-field record (`Long eventId`, `String seat`, `String customer`) and read the `detail`:
 
 | Body | Answer |
 | --- | --- |
 | (empty) | `the body is empty; send a JSON object` |
 | `[1]` | `the body must be a JSON object` |
-| `{"eventId":1,"seat":"A-3","customer":"Sam"} x` | `the body is not valid JSON` |
+| `{"eventId":1,"seat":"A-3","customer":"Sam"} x` | `the body has data after the JSON object` |
 | `{"eventId":1,"seat":"A-3","customer":"Sam"} {}` | `the body has data after the JSON object` |
 | `{"eventId":"1","seat":"A-3","customer":"Sam"}` | `/eventId has the wrong type` |
 | `{"eventId":99999999999999999999,...}` | `/eventId is out of range for this field` |
 | `{"eventId":1,"seat":"A-3",` | `the body is not valid JSON` |
-| `{"eventId":1,"eventId":2,...}` | `the body is not valid JSON` |
+| `{"eventId":1,"eventId":2,...}` | `/eventId appears more than once` |
 | `{"eventId":null,...}` | a success: `eventId` is `null` |
 | `{"eventId":1,"seat":"A-2","bogus":1}` | `/bogus is not a field of this request` |
+| `{"eventId":1,"seat":5,"customer":"Sam"}` | `/seat has the wrong type` |
 
-The `null` row binds, because the record uses `Long`, a type that may be `null`; the route then refuses it with its own rule (`/eventId must be 1 or more`, in `HoldRoutes.checked`). The two rows `x` and the repeated field are what a reader should know about: they are refused, which is the safe outcome, but the reason does not name the field.
+The `null` row binds, because the record uses `Long`, a type that may be `null`; the route then refuses it with its own rule (`/eventId must be 1 or more`, in `HoldRoutes.checked`). The rows with `x` and `{}` after the object get the same reason, because `hasMore` treats text that is not JSON as data too. In version 1.0.0 the `x` row and the repeated-field row both answered `the body is not valid JSON`.
 
 ### `write` and the pointer helpers
 
@@ -211,6 +228,16 @@ The `null` row binds, because the record uses `Long`, a type that may be `null`;
       return mapper.writeValueAsString(value);
     } catch (JsonProcessingException notWritable) {
       throw new IllegalArgumentException("not writable as JSON", notWritable);
+    }
+  }
+
+  private static boolean hasMore(JsonParser parser) throws IOException {
+    try {
+      return parser.nextToken() != null;
+    } catch (JacksonException notJson) {
+      // Text after the object that is not JSON at all ("{...} x") is still data after the object,
+      // and that is the reason the client needs, not "not valid JSON".
+      return true;
     }
   }
 
@@ -231,6 +258,7 @@ The `null` row binds, because the record uses `Long`, a type that may be `null`;
 ```
 
 - `write` calls `mapper.writeValueAsString(value)`. Writing can fail only if the value cannot be written, which is a bug, so the `JsonProcessingException` is turned into an `IllegalArgumentException`.
+- `hasMore` returns `parser.nextToken() != null`: true when another token follows the object. When the text after the object is not JSON at all (`{...} x`), `nextToken()` throws a `JacksonException` instead of returning a token. The `catch` answers `true` anyway, and the comment says why: that text is still data after the object, and that is the reason the client needs, not "not valid JSON".
 - `pointerOf` builds a **JSON pointer** (RFC 6901), a path such as `/eventId` that names one place in a JSON document. Jackson's exception carries the path it was reading; `getPath().stream().map(...).collect(Collectors.joining("/", "/", ""))` writes each step (a field name, or a list index) and joins them with `/` after a leading `/`. A stream is a pipeline of steps over a list; `joining` glues the strings with a separator, a prefix and a suffix.
 - `escaped` writes a `~` as `~0` and a `/` as `~1`, in that order, as RFC 6901 requires, so a field name that contains a slash cannot be mistaken for two steps.
 
@@ -340,7 +368,7 @@ CP=<project>/build/classes/java/main:$(find ~/.gradle -name 'jackson-databind-2.
 java -cp "$CP" Probe2.java
 ```
 
-   Expected, six lines (the first body is the empty text, so its line starts with spaces), for example `[1]  ->  Error[error=BindingProblem[pointer=, detail=the body must be a JSON object]]`, then the `x` line and the repeated-field line with `detail=the body is not valid JSON`, then `/bogus is not a field of this request`, and last `{"eventId":1,"seat":"A-1","customer":"Sam"}`, which is `write` of a record with its components in declaration order. (Each `Error[...]` line shows the record `BindingProblem` as the `toString` of a record prints it.)
+   Expected, six lines (the first body is the empty text, so its line starts with spaces), for example `[1]  ->  Error[error=BindingProblem[pointer=, detail=the body must be a JSON object]]`, then the `x` line with `detail=the body has data after the JSON object`, the repeated-field line with `pointer=/eventId, detail=appears more than once`, then `/bogus is not a field of this request`, and last `{"eventId":1,"seat":"A-1","customer":"Sam"}`, which is `write` of a record with its components in declaration order. (Each `Error[...]` line shows the record `BindingProblem` as the `toString` of a record prints it.)
 
 ## Mistakes people make
 
@@ -348,7 +376,8 @@ java -cp "$CP" Probe2.java
 - **Making a new `ObjectMapper` for every request.** It is costly. One mapper, configured once, is the documented safe pattern.
 - **Ignoring unknown fields to be "tolerant".** A typo then passes, and extra fields reach the code. This repository refuses them.
 - **Letting Jackson exceptions reach the client.** Their messages can quote the input and the internal class names. The codec maps each one to a short, safe sentence.
-- **Trusting the number of tokens.** An object followed by more data is a different failure from an object with a typo; the code looks for it on purpose.
+- **Trusting the number of tokens.** An object followed by more data is a different failure from an object with a typo; the code looks for it on purpose, and counts text that is not JSON as more data too.
+- **Relying on a library's message without a test.** The repeated-field reason depends on Jackson's wording, `Duplicate field '`. The codec keeps that text in one constant, and `JsonCodecTest` fails if a new Jackson version words it differently.
 - **Using a mutable class for a request.** A record cannot change after it is built, so a checked request stays checked.
 
 ## Check yourself

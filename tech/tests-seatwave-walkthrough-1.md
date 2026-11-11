@@ -1,6 +1,6 @@
 # The `seatwave` tests, part 1: the helpers, the lifecycle, the settings and the command line (line by line)
 
-This is part 1 of 2. This part reads the four helper classes (`TestSettings`, `MutableClock`, `TestDatabase`, `ScriptedHoldStore`) and the tests `LifecycleTest`, `ServiceSettingsTest` and `SeatWaveCliTest`. Part 2 (`tests-seatwave-walkthrough-2.md`) reads `JdbcHoldStoreTest`, `SeatWaveServerTest` and `HoldRoutesTest`. The notes were split because the test package is about 1,100 lines and each file quotes every line.
+This is part 1 of 2. This part reads the four helper classes (`TestSettings`, `MutableClock`, `TestDatabase`, `ScriptedHoldStore`) and the tests `LifecycleTest`, `ServiceSettingsTest` and `SeatWaveCliTest`. Part 2 (`tests-seatwave-walkthrough-2.md`) reads the helper `JdbcStandIns` and the tests `JdbcHoldStoreTest`, `SeatWaveServerTest` and `HoldRoutesTest`. The notes were split because the test package is about 1,500 lines and each file quotes every line.
 
 ## What it is
 
@@ -31,7 +31,7 @@ Terms you need.
 | `seatwave/TestDatabase.java` | A fresh H2 database from `db/schema.sql` for each test. |
 | `seatwave/ScriptedHoldStore.java` | A fake store a test can steer. |
 | `seatwave/LifecycleTest.java` | Eleven tests of the gate and the drain. |
-| `seatwave/ServiceSettingsTest.java` | Six tests of the settings rules. |
+| `seatwave/ServiceSettingsTest.java` | Eleven tests of the settings rules, the pool's lowest timeout and Docker's stop grace. |
 | `seatwave/SeatWaveCliTest.java` | Three tests of the command line. |
 
 ## How it works underneath
@@ -370,9 +370,11 @@ class LifecycleTest {
   private static final Duration LONG_WAIT = Duration.ofSeconds(10);
   private static final Duration SHORT_DEADLINE = Duration.ofMillis(50);
   private static final int RACERS = 8;
+  // Tries per racer after draining began, before the test lets the drain finish.
+  private static final long ATTEMPTS = 1_000;
 ```
 
-The imports show the tools: `assertThat`, `assertThatThrownBy` (for expected exceptions), `await` (Awaitility), executors and futures, atomics. `class LifecycleTest` has no `public`: JUnit does not need it. Constants: a long wait of 10 seconds (a safety limit, not an expected duration), a short deadline of 50 ms, and 8 racers.
+The imports show the tools: `assertThat`, `assertThatThrownBy` (for expected exceptions), `await` (Awaitility), executors and futures, atomics. `class LifecycleTest` has no `public`: JUnit does not need it. Constants: a long wait of 10 seconds (a safety limit, not an expected duration), a short deadline of 50 ms, 8 racers, and, new in 1.1.0, `ATTEMPTS`: 1,000 tries per racer after draining began, which the race test waits for before it lets the drain finish (the comment says it).
 
 ```java
   @Test
@@ -477,7 +479,11 @@ Two tests of the gate.
 
       running.close();
 
-      assertThat(drained.get(LONG_WAIT.toSeconds(), TimeUnit.SECONDS).inFlightLeft()).isZero();
+      // The last release wakes the drain: it ends at once, not when the 10 s deadline passes
+      // (a lost wake-up would still end "clean", only 10 s late).
+      Lifecycle.DrainResult result = drained.get(LONG_WAIT.toSeconds(), TimeUnit.SECONDS);
+      assertThat(result.inFlightLeft()).isZero();
+      assertThat(result.waited()).isLessThan(LONG_WAIT.dividedBy(2));
     }
   }
 ```
@@ -490,8 +496,9 @@ Two tests of the gate.
 4. `drained.isDone()` must be false: the drain must still be waiting, because the request has not finished.
 5. `running.close()` ends the request.
 6. `drained.get(10, SECONDS)` collects the result; `inFlightLeft()` must be zero.
+7. New in 1.1.0: `result.waited()`, how long the drain waited, must be less than half the long wait (`LONG_WAIT.dividedBy(2)`, 5 s).
 
-A limit of this test, found by breaking the code: if the `idle.signalAll()` call in `Lifecycle.release` is removed, the drain is never woken. The background thread then waits for its full 10 second deadline, wakes up, sees zero in flight and returns a clean result. The test still passes, only 10 seconds later. I removed that line in a scratch copy and ran `LifecycleTest` and `SeatWaveServerTest`: both passed, twice, and the two drain tests took 10.0 s and 10.5 s. The test never checks how long the drain took. An assertion that `result.waitedMillis()` is far below the deadline would catch it.
+Step 7 closes a gap. The drain sleeps on a **condition** (a place where a thread waits until another thread signals it). When the last request ends, `Lifecycle.release` calls `idle.signalAll()` to wake the drain. If that call were missing, the drain would sleep until its full 10 s deadline, wake up, see zero in flight and still return a clean result; the comment in the test calls this a **lost wake-up**. In version 1.0.0 the test passed with the call removed, only 10 seconds later. Now it fails: the mutation check removes `idle.signalAll()`, and this test (and `SeatWaveServerTest`'s drain test) fails. Half the wait is a wide margin: a woken drain ends within milliseconds.
 
 ```java
   @Test
@@ -544,15 +551,18 @@ A limit of this test, found by breaking the code: if the `idle.signalAll()` call
   void admitsNothingAfterDrainingStartsEvenUnderARace() throws Exception {
     Lifecycle lifecycle = new Lifecycle();
     lifecycle.markReady();
+    // Held open by the test, so the drain cannot end before the racers have tried many times.
+    Lifecycle.Admission held = lifecycle.tryAdmit().orElseThrow();
     AtomicBoolean drainingStarted = new AtomicBoolean();
+    AtomicLong attemptsAfterDrain = new AtomicLong();
     AtomicLong admittedAfterDrain = new AtomicLong();
-    CountDownLatch go = new CountDownLatch(1);
+    CountDownLatch racing = new CountDownLatch(RACERS);
     List<Future<?>> racers = new ArrayList<>();
-    try (ExecutorService threads = Executors.newFixedThreadPool(RACERS + 1)) {
+    try (ExecutorService threads = Executors.newFixedThreadPool(RACERS)) {
       for (int racer = 0; racer < RACERS; racer++) {
         racers.add(
             threads.submit(() -> {
-              go.await();
+              boolean isCounted = false;
               while (lifecycle.state() != LifecycleState.STOPPED) {
                 // Read the flag before asking: an admission granted after the flag was set means
                 // the gate let a request through after draining began.
@@ -564,13 +574,24 @@ A limit of this test, found by breaking the code: if the `idle.signalAll()` call
                   }
                   admission.get().close();
                 }
+                if (wasDraining) {
+                  attemptsAfterDrain.incrementAndGet();
+                }
+                if (!isCounted) {
+                  // This racer is in its loop: the drain starts only when every racer is.
+                  isCounted = true;
+                  racing.countDown();
+                }
               }
               return null;
             }));
       }
-      go.countDown();
+      assertThat(racing.await(LONG_WAIT.toSeconds(), TimeUnit.SECONDS)).isTrue();
       lifecycle.startDraining();
       drainingStarted.set(true);
+      // The race is real: the racers keep asking while the instance drains.
+      await().atMost(LONG_WAIT).until(() -> attemptsAfterDrain.get() >= RACERS * ATTEMPTS);
+      held.close();
       Lifecycle.DrainResult result = lifecycle.awaitDrained(LONG_WAIT);
       for (Future<?> racerDone : racers) {
         racerDone.get(LONG_WAIT.toSeconds(), TimeUnit.SECONDS);
@@ -580,19 +601,23 @@ A limit of this test, found by breaking the code: if the `idle.signalAll()` call
       assertThat(result.isClean()).isTrue();
     }
   }
+}
 ```
 
-**`admitsNothingAfterDrainingStartsEvenUnderARace`.** The module's central test.
+**`admitsNothingAfterDrainingStartsEvenUnderARace`.** The module's central test, rebuilt in 1.1.0 so that the race really happens.
 
-1. A ready lifecycle; a flag `drainingStarted`; a counter `admittedAfterDrain`; a latch `go`.
-2. Eight racer tasks are started on a pool. Each waits at `go.await()`, and then loops until the state is `STOPPED`. In each turn it **reads the flag first**, then calls `tryAdmit()`. If an admission is granted and the flag was already true, the gate let a request in after draining began, and the counter goes up. Each admission is closed at once so the in-flight count stays small.
-3. The main thread opens the latch (`go.countDown()`), calls `startDraining()`, and only afterwards sets the flag. Because the flag is set after `startDraining()` returns, a racer that reads `true` read it after the state had changed, so any admission it then gets is a violation.
-4. `awaitDrained(10 s)` runs, and each racer's future is collected.
-5. The counter must be zero, and the drain must be clean.
+1. A ready lifecycle, and one admission `held` that the test keeps open. While it is open, the drain cannot finish, so the racers keep running after draining began. The comment says it.
+2. A flag `drainingStarted`; two counters, `attemptsAfterDrain` (tries made after the flag was set) and `admittedAfterDrain` (violations); and a latch `racing` with a count of 8, one per racer.
+3. Eight racer tasks start on a pool of eight threads. Each loops until the state is `STOPPED`. In each turn it **reads the flag first**, then calls `tryAdmit()`. If an admission is granted and the flag was already true, the gate let a request in after draining began, and the violation counter goes up. Each admission is closed at once so the in-flight count stays small. A turn that began after the flag was set also counts one attempt.
+4. On its first turn each racer counts the latch down once (`isCounted` remembers that it did). The comment says why: the drain starts only when every racer is inside its loop.
+5. The main thread waits for the latch (`racing.await(10 s)` must return true), then calls `startDraining()`, and only afterwards sets the flag. Because the flag is set after `startDraining()` returns, a racer that reads `true` read it after the state had changed, so any admission it then gets is a violation.
+6. `await().atMost(10 s).until(() -> attemptsAfterDrain >= 8 x 1,000)`: the test waits until the racers together have tried at least 8,000 times while draining. Only then does it close `held`, so the drain can end.
+7. `awaitDrained(10 s)` runs, and each racer's future is collected.
+8. The violation counter must be zero, and the drain must be clean.
 
 Why the order is right: if the code read the flag after asking, a request admitted just before draining began could be misjudged as a violation. Reading before asking is the strict direction.
 
-How strong the test is, measured. In a scratch copy I changed the gate to admit in any state except `STOPPED` (the line `if (state != LifecycleState.READY)` became `if (state == LifecycleState.STOPPED)`). Run alone, six times, this test failed twice and passed four times. It is a weak detector: the drain can finish before the racer threads have even started, and then they see `STOPPED` and leave having proven nothing. The three plain gate tests above caught the same fault every time, so the gate is protected, though not by this test.
+Why it was rebuilt. In version 1.0.0 the drain could finish before the racer threads had even started; they then saw `STOPPED` and left having proven nothing. With the gate broken on purpose (admitting in any state but `STOPPED`), the old test failed only two runs in six. Now every racer is in its loop before the drain starts, and the drain cannot end before 8,000 tries were made against the draining gate. The mutation check applies that same broken gate (`if (state == LifecycleState.STARTING)` in place of `if (state != LifecycleState.READY)`) and runs this test alone, and it fails.
 
 ### `seatwave/ServiceSettingsTest.java`
 
@@ -603,18 +628,23 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import com.github.sviperll.result4j.Result;
+import com.zaxxer.hikari.HikariDataSource;
 import io.plainround.seatwave.balancer.config.SettingsReader;
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.List;
 import java.util.Properties;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import org.junit.jupiter.api.Test;
 
 class ServiceSettingsTest {
 ```
 
-The imports and the class. The tests use `Properties` objects built in memory, and one real file.
+The imports and the class. The tests use `Properties` objects built in memory, and two real files. New in 1.1.0: `HikariDataSource` (the connection pool, see `hikaricp.md`) for the pool test, `Files` and `StandardCharsets` to read `compose.yaml`, and `Pattern` and `Matcher` to find a line in it.
 
 ```java
   @Test
@@ -635,7 +665,38 @@ The imports and the class. The tests use `Properties` objects built in memory, a
   }
 ```
 
-**`readsTheContainerSettingsShippedWithTheProject`.** It reads the real file `config/seatwave-container.properties` through `SettingsReader.load`, passes it to `ServiceSettings.from`, and uses a `switch` over the `Result`: a success gives the settings, an error throws an `AssertionError` that lists the problems. Then it checks two values: the pool size is 16 and the drain deadline is 20 seconds. This test keeps the shipped file valid: if someone edits the file wrongly, the build fails here, not when the stack starts.
+**`readsTheContainerSettingsShippedWithTheProject`.** It reads the real file `config/seatwave-container.properties` through `SettingsReader.load`, passes it to `ServiceSettings.from`, and uses a `switch` over the `Result`: a success gives the settings, an error throws an `AssertionError` that lists the problems. Then it checks two values: the pool size is 16 and the drain deadline is 20 seconds. This test keeps the shipped file valid: if someone edits the file wrongly, the build fails here, not when the stack starts. Since 1.1.0 `config/` is an input of the test task, so the mutation check's `db.poolSize=0` makes this test fail even without `cleanTest`.
+
+```java
+  @Test
+  void givesDockerStopMoreTimeThanTheWorstCaseShutdown() throws IOException {
+    ServiceSettings shipped =
+        switch (ServiceSettings.from(
+            new SettingsReader(
+                SettingsReader.load(Path.of("config/seatwave-container.properties"))))) {
+          case Result.Success<ServiceSettings, List<String>>(ServiceSettings checked) -> checked;
+          case Result.Error<ServiceSettings, List<String>>(List<String> problems) ->
+              throw new AssertionError(problems.toString());
+        };
+    String compose = Files.readString(Path.of("compose.yaml"), StandardCharsets.UTF_8);
+    Matcher grace = Pattern.compile("\n  stop_grace_period: ([0-9]+)s\n").matcher(compose);
+    assertThat(grace.find()).isTrue();
+
+    // The drain deadline, then the wait for the workers: docker must not SIGKILL inside either.
+    Duration worstCaseStop = shipped.drainDeadline().plus(SeatWaveServer.WORKER_STOP_WAIT);
+
+    assertThat(Duration.ofSeconds(Long.parseLong(grace.group(1)))).isGreaterThan(worstCaseStop);
+  }
+```
+
+**`givesDockerStopMoreTimeThanTheWorstCaseShutdown`.** New in 1.1.0. `docker stop` sends the instance the signal SIGTERM (please stop), waits `stop_grace_period`, then sends SIGKILL (stop now, with no clean-up). The instance's longest clean stop is its drain deadline plus the time it then gives its worker threads to finish. If Docker's wait were shorter, a draining instance could be killed in the middle.
+
+1. Read the shipped settings, as in the test above.
+2. Read `compose.yaml` as text and find the line `  stop_grace_period: <n>s` with a pattern. `([0-9]+)` captures the number. `grace.find()` must be true: the line exists.
+3. `worstCaseStop` is the drain deadline (20 s) plus `SeatWaveServer.WORKER_STOP_WAIT` (5 s): 25 s. The comment names both parts.
+4. The grace period read from the file (30 s) must be greater than 25 s.
+
+The test reads both numbers from the files the stack really uses, so a change to either is checked. The mutation check sets `stop_grace_period: 25s`, and this test fails (25 is not greater than 25).
 
 ```java
   @Test
@@ -679,6 +740,81 @@ The imports and the class. The tests use `Properties` objects built in memory, a
 
 ```java
   @Test
+  void reportsAMissingWorkerCountOnceWithoutTheRuleThatNeedsIt() {
+    Properties properties = valid();
+    properties.remove("http.workerThreads");
+
+    Result<ServiceSettings, List<String>> read =
+        ServiceSettings.from(new SettingsReader(properties));
+
+    assertThat(read).isEqualTo(Result.error(List.of("http.workerThreads is missing")));
+  }
+```
+
+**`reportsAMissingWorkerCountOnceWithoutTheRuleThatNeedsIt`.** New in 1.1.0. With `http.workerThreads` removed, the reader reports it missing, and the rule "pool not larger than workers" must not run on a value nobody wrote: the result is exactly the one line `http.workerThreads is missing`. The code runs the rule only when both numbers were read (`workersRead && poolRead`). The mutation check drops that condition, a second, misleading line appears, and this test fails.
+
+```java
+  @Test
+  void refusesAConnectTimeoutTheConnectionPoolCannotUse() {
+    // HikariCP throws for a connectionTimeout under 250 ms; it must be a settings problem instead.
+    Properties properties = valid();
+    properties.setProperty("db.connectTimeoutMillis", "249");
+
+    Result<ServiceSettings, List<String>> read =
+        ServiceSettings.from(new SettingsReader(properties));
+
+    assertThat(read)
+        .isEqualTo(
+            Result.error(
+                List.of("db.connectTimeoutMillis must be from 250 to 600000, but was 249")));
+  }
+```
+
+**`refusesAConnectTimeoutTheConnectionPoolCannotUse`.** New in 1.1.0. HikariCP, the connection pool, refuses a connection timeout under 250 ms by throwing an exception, as the comment says. In version 1.0.0 the settings allowed 1 ms, so a value such as 249 passed the settings check and then crashed the start with a stack trace. Now the lowest allowed value is 250, and 249 gives exactly one problem: `db.connectTimeoutMillis must be from 250 to 600000, but was 249`.
+
+```java
+  @Test
+  void opensThePoolWithTheShortestConnectTimeoutTheSettingsAllow() throws IOException {
+    Properties properties = valid();
+    properties.setProperty("db.connectTimeoutMillis", "250");
+    ServiceSettings settings =
+        switch (ServiceSettings.from(new SettingsReader(properties))) {
+          case Result.Success<ServiceSettings, List<String>>(ServiceSettings checked) -> checked;
+          case Result.Error<ServiceSettings, List<String>>(List<String> problems) ->
+              throw new AssertionError(problems.toString());
+        };
+    Path password = Files.createTempFile("seatwave-password", ".txt");
+    try {
+      Files.writeString(password, "test-only", StandardCharsets.UTF_8);
+      ServiceSettings.DatabaseSettings database =
+          new ServiceSettings.DatabaseSettings(
+              "jdbc:h2:mem:pool-" + System.nanoTime(),
+              "sa",
+              password,
+              1,
+              settings.database().connectTimeout(),
+              settings.database().checkTimeout());
+
+      try (HikariDataSource pool = DatabasePool.open(database, "seatwave-test")) {
+        assertThat(pool.getConnectionTimeout()).isEqualTo(250);
+      }
+    } finally {
+      Files.delete(password);
+    }
+  }
+```
+
+**`opensThePoolWithTheShortestConnectTimeoutTheSettingsAllow`.** The other half of the same rule: the lowest value the settings accept must be one HikariCP accepts.
+
+1. Valid settings with `db.connectTimeoutMillis=250`, read through `ServiceSettings.from`.
+2. `Files.createTempFile("seatwave-password", ".txt")` makes an empty file with a unique name in the system's temporary folder; the test writes `test-only` into it. The `try ... finally` deletes it whatever happens.
+3. A `DatabaseSettings` is built by hand: an in-memory H2 URL with a unique name (`jdbc:h2:mem:pool-` and the time), the user `sa`, the password file, a pool of 1 connection, and the two timeouts from the settings.
+4. `DatabasePool.open(database, "seatwave-test")` opens a real HikariCP pool; `try ( ... )` closes it. `pool.getConnectionTimeout()` must be 250.
+
+If the settings' minimum were lower than HikariCP's, step 4 would throw for a value the settings had approved. The mutation check sets the minimum back to 1; then 249 passes the settings and the test above fails.
+
+```java
+  @Test
   void refusesAJdbcUrlForAnotherDatabase() {
     Properties properties = valid();
     properties.setProperty("db.url", "jdbc:mysql://10.0.0.1:3306/seatwave");
@@ -696,6 +832,26 @@ The imports and the class. The tests use `Properties` objects built in memory, a
   @Test
   void refusesAHostNameAsTheBindAddress() {
     Properties properties = valid();
+    properties.setProperty("http.bindAddress", "localhost");
+
+    Result<ServiceSettings, List<String>> read =
+        ServiceSettings.from(new SettingsReader(properties));
+
+    assertThat(read)
+        .isEqualTo(
+            Result.error(
+                List.of(
+                    "http.bindAddress must match [0-9.]{7,15}|[0-9a-fA-F:]{2,39}, but was"
+                        + " localhost")));
+  }
+```
+
+**`refusesAHostNameAsTheBindAddress`.** Since 1.1.0 it really tests a host name: `localhost`. A host name would need a name lookup before the server could start, so only an IP address is allowed. The value fails the first, character-level rule, and the exact sentence is pinned: `http.bindAddress must match [0-9.]{7,15}|[0-9a-fA-F:]{2,39}, but was localhost`. The pattern accepts 7 to 15 digits and dots (an IPv4 address) or 2 to 39 hexadecimal digits and colons (an IPv6 address). In version 1.0.0 this test used `999.1.1.1`, so its name promised more than it did; that case moved to the next test.
+
+```java
+  @Test
+  void refusesDottedNumbersThatAreNotAnIpAddress() {
+    Properties properties = valid();
     properties.setProperty("http.bindAddress", "999.1.1.1");
 
     Result<ServiceSettings, List<String>> read =
@@ -707,7 +863,7 @@ The imports and the class. The tests use `Properties` objects built in memory, a
   }
 ```
 
-**`refusesAHostNameAsTheBindAddress`.** Despite the name, the value used is `999.1.1.1`, not a host name: it passes the character filter (digits and dots) and fails `InetAddress.ofLiteral`. The expected result is the exact sentence `http.bindAddress must be an IP address, but was 999.1.1.1`. The test name promises more than the test does: a real host name such as `localhost` would be stopped earlier, by the character filter, with a different sentence (`http.bindAddress must match ...`), and is not tested.
+**`refusesDottedNumbersThatAreNotAnIpAddress`.** `999.1.1.1` passes the character rule (digits and dots) and fails `InetAddress.ofLiteral`, because 999 is above 255. The expected result is the exact sentence `http.bindAddress must be an IP address, but was 999.1.1.1`.
 
 ```java
   @Test
@@ -746,7 +902,7 @@ The imports and the class. The tests use `Properties` objects built in memory, a
 
 `valid()` returns a complete, correct `Properties` object with the thirteen keys. It is package-visible, and `SeatWaveCliTest` reuses it. The values: loopback, ports 21090 and 21091, 64 workers, a queue of 100, a PostgreSQL URL, pool 16, timeouts 1000, drain 20000.
 
-Gaps worth knowing. No test passes a connect timeout below 250 ms, which HikariCP refuses (see `hikaricp.md`). No test covers the minimum of `readiness.checkTimeoutMillis`.
+A gap worth knowing: no test covers the minimum of `readiness.checkTimeoutMillis`.
 
 ### `seatwave/SeatWaveCliTest.java`
 
@@ -784,11 +940,11 @@ The imports and fields. `@TempDir Path folder` gives each test a new folder. Two
         start("config/seatwave-container.properties", "Seat Wave");
 
     assertThat(running).isEmpty();
-    assertThat(text(err)).contains("usage: serve");
+    assertThat(text(err)).contains("usage: SeatWaveCli");
   }
 ```
 
-**`refusesAnInstanceNameThatIsNotAName`.** `Seat Wave` (with a space and capitals) does not fit `[a-z][a-z0-9-]{0,31}`. `start` must return an empty `Optional` and print a line that contains `usage: serve`.
+**`refusesAnInstanceNameThatIsNotAName`.** `Seat Wave` (with a space and capitals) does not fit `[a-z][a-z0-9-]{0,31}`. `start` must return an empty `Optional` and print a line that contains `usage: SeatWaveCli`. In version 1.0.0 the usage line said `usage: serve`, the name of a command that does not exist; it now names the class a reader would run.
 
 ```java
   @Test
@@ -861,7 +1017,7 @@ It runs a real HikariCP pool over H2 and a real server. It does not send a reque
 
 The helpers. `start` calls `SeatWaveCli.start` with two arguments and two `PrintStream`s (UTF-8, auto-flushing) that write into the byte streams. `settings(passwordFile)` starts from `ServiceSettingsTest.valid()`, overrides the ports (0), the database URL, the password file and a 1 second drain, and writes the file with `Properties.store`. `text(stream)` decodes a byte stream as UTF-8.
 
-What the CLI tests leave out: `main` itself (the part that exits with status 2 and registers the shutdown hook) is not run by any test; JaCoCo shows the lines of `main` as missed.
+What the CLI tests leave out: `main` itself (the part that exits with status 2 and registers the shutdown hook) is not run by any test.
 
 ## Try it yourself
 
@@ -884,17 +1040,49 @@ sed -i.bak 's/if (state != LifecycleState.READY) {/if (state == LifecycleState.S
 cd ../.. && rm -rf build/gate-check
 ```
 
-In the run for these notes, three `LifecycleTest` tests failed (`refusesNewRequestsOnceDrainingStarts`, `neverBecomesReadyAgainAfterDrainingStarted`, `refusesEveryRequestWhileStarting`) and the build failed. The change lets the gate admit while draining. The race test may or may not join them, as explained above.
+In the run for these notes, the output was:
 
-3. Run the settings and command-line tests.
+```text
+> Task :test FAILED
+LifecycleTest > refusesNewRequestsOnceDrainingStarts() FAILED
+LifecycleTest > neverBecomesReadyAgainAfterDrainingStarted() FAILED
+LifecycleTest > admitsNothingAfterDrainingStartsEvenUnderARace() FAILED
+LifecycleTest > refusesEveryRequestWhileStarting() FAILED
+BUILD FAILED in 2s
+```
+
+The change lets the gate admit while starting and while draining. Four tests fail, the race test among them: in version 1.0.0 the race test caught this change only two runs in six.
+
+3. Remove the wake-up, in a copy, and watch the time check catch it.
+
+```bash
+rm -rf build/wake-check && mkdir build/wake-check
+rsync -a --exclude build --exclude .gradle ./ build/wake-check/
+cd build/wake-check
+sed -i.bak '/idle.signalAll();/d' src/main/java/io/plainround/seatwave/balancer/seatwave/Lifecycle.java
+./gradlew --offline cleanTest test --tests '*LifecycleTest' 2>&1 | grep -E "FAILED|BUILD"
+cd ../.. && rm -rf build/wake-check
+```
+
+In the run for these notes:
+
+```text
+LifecycleTest > waitsUntilTheLastInFlightRequestFinishes() FAILED
+> Task :test FAILED
+BUILD FAILED in 11s
+```
+
+The build takes about 10 seconds longer: the drain without its wake-up sleeps to its 10 s deadline, and the new check on `waited()` turns that into a failure.
+
+4. Run the settings and command-line tests.
 
 ```bash
 ./gradlew --offline cleanTest test --tests '*ServiceSettingsTest' --tests '*SeatWaveCliTest' 2>&1 | grep -E "PASSED|FAILED|BUILD"
 ```
 
-Nine tests pass (six and three).
+Fourteen tests pass (eleven and three).
 
-4. Look at how long tests take. Gradle writes one XML file per class; this prints the slowest tests of the last run.
+5. Look at how long tests take. Gradle writes one XML file per class; this prints the slowest tests of the last run.
 
 ```bash
 ./gradlew --offline cleanTest test > /dev/null 2>&1
@@ -908,7 +1096,15 @@ for r in sorted(rows,reverse=True)[:3]: print(r)
 "
 ```
 
-On this machine the slowest was `stopsAtTheDeadlineWhenARequestNeverFinishes()` at about 5.2 seconds. It is always about five seconds, because a request that never finishes keeps a worker busy until `drainAndStop` gives up waiting for the worker pool (`WORKER_STOP_SECONDS = 5`) and interrupts it. The same five seconds are added to a real shutdown whose deadline passes: the worst-case stop is the drain deadline plus five seconds, 25 seconds with the shipped settings, against the 30 seconds that `compose.yaml` gives Docker.
+On the run for these notes the three slowest were:
+
+```text
+(1.123, 'HarnessCliTest', 'runsTheLoadWatchesTheBalancerAndReports()')
+(0.615, 'RollingDeployTest', 'waitsTheSettleTimeBeforeTheNextInstance()')
+(0.4, 'JdbcHoldStoreTest', 'letsExactlyOneOfManyRacersHoldOneSeat()')
+```
+
+The slowest is the harness's integration test, which really sends load for 1.1 seconds. Second is the settle test of the deploy, which sleeps its 300 ms settle on purpose. No test of this part is among the slowest: the drain tests end as soon as the last request does.
 
 ## Mistakes people make
 
@@ -916,10 +1112,11 @@ On this machine the slowest was `stopsAtTheDeadlineWhenARequestNeverFinishes()` 
 - **Real time in expiry tests.** A test that waits 300 seconds is not run. `MutableClock.advance` moves time instantly.
 - **Sharing one database between tests.** Rows from one test would change the answers of another. `TestDatabase.create()` uses a random name for each.
 - **A fixed port.** Another program, or a parallel test, may hold it. Port 0 takes any free one.
-- **A race test that proves nothing.** A race test must be able to fail. Check that it fails when the code is broken, as in step 2.
+- **A race test that does not race.** A race test must make sure the threads are running when the event happens, and must keep the window open long enough. The latch and the held admission do both. Check that it fails when the code is broken, as in step 2.
 - **Reading the flag after the action.** In the race test, order decides whether a pass means anything.
-- **Asserting the result but not the time.** The drain tests would pass with a lost wake-up, because they never check that the drain ended soon.
-- **A test name that promises more than the test.** `refusesAHostNameAsTheBindAddress` tests a bad IP address.
+- **Asserting the result but not the time.** A lost wake-up still ends "clean". The drain test now checks that the drain ended well before its deadline.
+- **Checking a rule on a value that was never read.** A missing key already has its own problem line; a rule that compares it adds a second, wrong one. The "once" tests guard against that.
+- **Two limits for one value.** The settings allowed a connect timeout that the pool refuses. The two pool tests pin the settings' minimum to the pool's.
 
 ## Check yourself
 
@@ -927,12 +1124,12 @@ On this machine the slowest was `stopsAtTheDeadlineWhenARequestNeverFinishes()` 
    Answer: to make a time-zone change loud, so a test cannot quietly pass with a clock that ignores the zone.
 2. In the race test, why is the flag read before `tryAdmit` and set after `startDraining` returns?
    Answer: so that a racer that sees `true` is sure draining had already started when it asked; any admission it then gets is a real violation, never a mistaken one.
-3. What does `ScriptedHoldStore` give the tests that the real store cannot?
-   Answer: the ability to keep a request open (to have one in flight during a drain), to be down, and to answer readiness as told, without a database.
-4. Why do `SeatWaveCliTest` tests use port 0?
-   Answer: so the operating system picks free ports and tests do not collide with other programs or each other.
-5. Name one thing the tests of this part do not check.
-   Answer: that a drain ends promptly (a lost wake-up would pass); a connect timeout under 250 ms (the pool refuses it); the `main` method.
+3. Why does the race test keep one admission open until 8,000 attempts were made?
+   Answer: an open admission stops the drain from finishing, so the racers are still trying while the instance drains; without it the drain could end before the race began.
+4. How does `givesDockerStopMoreTimeThanTheWorstCaseShutdown` compute the worst case, and what does it compare it with?
+   Answer: the drain deadline from the shipped settings plus `SeatWaveServer.WORKER_STOP_WAIT` (20 s + 5 s), against `stop_grace_period` read from `compose.yaml` (30 s).
+5. Why must the lowest allowed `db.connectTimeoutMillis` be 250?
+   Answer: HikariCP throws for a connection timeout under 250 ms, so a lower value would pass the settings check and then crash the start.
 
 ## Further reading
 
@@ -940,5 +1137,8 @@ On this machine the slowest was `stopsAtTheDeadlineWhenARequestNeverFinishes()` 
 - AssertJ core documentation: https://assertj.github.io/doc/
 - Awaitility usage: https://github.com/awaitility/awaitility/wiki/Usage
 - Java SE 25 API, `java.util.concurrent.CountDownLatch`: https://docs.oracle.com/en/java/javase/25/docs/api/java.base/java/util/concurrent/CountDownLatch.html
+- Java SE 25 API, `java.util.concurrent.locks.Condition` (signals and lost wake-ups): https://docs.oracle.com/en/java/javase/25/docs/api/java.base/java/util/concurrent/locks/Condition.html
 - Java SE 25 API, `java.time.Clock`: https://docs.oracle.com/en/java/javase/25/docs/api/java.base/java/time/Clock.html
+- HikariCP configuration (`connectionTimeout`, lowest accepted value 250 ms): https://github.com/brettwooldridge/HikariCP#gear-configuration-knobs-baby
+- Docker Compose file reference, `stop_grace_period`: https://docs.docker.com/reference/compose-file/services/#stop_grace_period
 - Gradle 9.9.1 user guide, testing in Java and the `test` task: https://docs.gradle.org/9.9.1/userguide/java_testing.html

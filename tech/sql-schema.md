@@ -33,6 +33,7 @@ Module 10 puts three SeatWave instances behind a balancer. Before, each instance
 | `compose.yaml` | Mounts the file into PostgreSQL's start-up folder; PostgreSQL runs it once, when its data volume is new. |
 | `seatwave/JdbcHoldStore.java` | Runs `SELECT`, `UPDATE` and `INSERT` against these tables (see `java-seatwave-walkthrough-3.md`). |
 | `seatwave/TestDatabase.java` | Runs the same file on H2 before each test (see `tests-seatwave-walkthrough-1.md`). |
+| `scripts/common.sh` | `give_seats_back` runs one `UPDATE` on `seats` through `psql` before and after every lab run: every `HELD` seat becomes `AVAILABLE` again with its hold columns emptied (see `shell-scripts-walkthrough.md`). |
 
 ## How it works underneath
 

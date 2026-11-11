@@ -81,7 +81,7 @@ Line by line.
 
 Everything not set keeps HikariCP's default. The three that matter here: `maxLifetime` 30 minutes, `keepaliveTime` 2 minutes (a periodic test of idle connections), and `autoCommit` true.
 
-HikariCP refuses some values. A connection timeout below 250 ms is an error: `IllegalArgumentException: connectionTimeout cannot be less than 250ms`. A validation timeout below 250 ms is refused the same way. `ServiceSettings` accepts a connection timeout from 1 ms, so a settings file with `db.connectTimeoutMillis=100` passes the checks and crashes the program at start (exit status 1 and a stack trace). The validation side is safe: `readiness.checkTimeoutMillis` has a minimum of 1,000.
+HikariCP refuses some values. A connection timeout below 250 ms is an error: `IllegalArgumentException: connectionTimeout cannot be less than 250ms`. A validation timeout below 250 ms is refused the same way. `ServiceSettings` keeps both inside those limits. It accepts `db.connectTimeoutMillis` from 250 (`MIN_CONNECT_MILLIS`, whose comment names `HikariConfig` 7.1.0 as the source of the floor) and `readiness.checkTimeoutMillis` from 1,000. A file with `db.connectTimeoutMillis=100` is refused with one problem line, `db.connectTimeoutMillis must be from 250 to 600000, but was 100`, and exit status 2. Version 1.0.0 accepted it from 1 ms and crashed at start with a stack trace and exit status 1. `ServiceSettingsTest.opensThePoolWithTheShortestConnectTimeoutTheSettingsAllow` opens a real pool with 250 and reads the timeout back.
 
 ### The pool's place in start and stop
 
@@ -176,7 +176,7 @@ EOF
 |  Exception java.lang.IllegalArgumentException: connectionTimeout cannot be less than 250ms
 ```
 
-3. Start an instance with a database address where nothing listens (the steps are in `java-seatwave-walkthrough-2.md`) and read its log. The pool says `Start completed` at once, with no database, and a request that needs the database fails after the connect timeout with a `503`. In the run for these notes, three such requests together took 3.10 seconds, one second each plus a few milliseconds.
+3. Start an instance with a database address where nothing listens (the steps are in `java-seatwave-walkthrough-2.md`) and read its log. The pool says `Start completed` at once, with no database, and a request that needs the database fails after the connect timeout with a `503`. In the run for these notes, three such requests together took 3.06 seconds, one second each plus a few milliseconds.
 
 4. Run the pool-related tests.
 
@@ -192,7 +192,7 @@ Three tests pass: one of them starts a real instance on port 0, with a Hikari po
 - **Leaving a connection open.** A borrowed connection that is never closed is never returned; after 16 such leaks, the pool is empty and every request times out. Every use here is inside a try-with-resources block.
 - **Waiting too long for a connection.** A 30 second wait ties up a thread for 30 seconds, which makes an overload worse. A short wait and a quick `503` lets the balancer try another instance.
 - **Starting the pool before the database exists and failing.** The default start check would stop the instance; the negative initialization timeout makes it wait instead.
-- **Setting a limit the library refuses.** The 250 ms floor above.
+- **Setting a limit the library refuses.** The 250 ms floor above. The settings reader now uses the library's floor as its own minimum, so the mistake becomes a problem line, not a crash.
 - **Letting two pools share a name.** Three instances run in three containers, each with its own pool; the pool name is the instance name, so log lines are told apart.
 - **Closing the pool before the work ends.** `SeatWaveCli.stop` drains the server first.
 
@@ -207,7 +207,7 @@ Three tests pass: one of them starts a real instance on port 0, with a Hikari po
 4. What does `setInitializationFailTimeout(-1)` allow?
    Answer: the pool starts without a connection, so an instance can start while the database is down; readiness then reports `database-unreachable`.
 5. What is the smallest connection timeout HikariCP accepts, and what does this project's settings reader accept?
-   Answer: HikariCP accepts 250 ms or more. The settings reader accepts 1 ms or more, so values from 1 to 249 crash at start.
+   Answer: HikariCP accepts 250 ms or more, and so does this project's settings reader (`MIN_CONNECT_MILLIS` is 250). A value from 1 to 249 is reported as a settings problem before the pool is built.
 
 ## Further reading
 

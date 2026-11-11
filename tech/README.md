@@ -61,7 +61,7 @@ The repository is the hands-on project of Module 10, "Spreading the load", of a 
 | `toml-version-catalog.md` | `gradle/libs.versions.toml`, the one place for dependency versions. |
 | `dependency-locking.md` | `gradle.lockfile` and `settings-gradle.lockfile`, which pin exact versions of 34 jars. |
 | `spotless-google-java-format.md` | The formatter that the build enforces. |
-| `jacoco.md` | The line-coverage tool and its 80 percent floor; the real coverage is 89.3 percent. |
+| `jacoco.md` | The line-coverage tool and its 80 percent floor; the real coverage is 93.4 percent. |
 
 **The tests**
 
@@ -69,7 +69,7 @@ The repository is the hands-on project of Module 10, "Spreading the load", of a 
 |---|---|
 | `junit.md` | JUnit: how the test engine finds and runs the tests, and the `stack` tag that keeps Docker out of `check`. |
 | `assertj.md` | AssertJ: the fluent assertions used in the tests. |
-| `awaitility.md` | Awaitility: waiting for a condition, used twice, to test the drain rule. |
+| `awaitility.md` | Awaitility: waiting for a condition instead of sleeping, in the drain, admission-race, metrics, watch and stack tests. |
 | `tests-seatwave-walkthrough-1.md` | The `seatwave` tests, part 1: the helpers, the lifecycle, the settings and the command line (line by line). |
 | `tests-seatwave-walkthrough-2.md` | The `seatwave` tests, part 2: the store, the server and the routes (line by line). |
 | `tests-config-walkthrough.md` | The tests of the `config` package and the rules test that reads `haproxy.cfg` and `compose.yaml`. |
@@ -114,7 +114,7 @@ The notes of the build files and the libraries were checked on 11 November 2026 
 ./gradlew -q deploy --args='config/deploy.properties'
 ```
 
-`check` runs 98 tests with a line coverage of 89.3 percent (1,433 of 1,604 lines). `stackFiles` collects the eleven jars that the container image copies into `build/stack/lib`. The `deploy` task, without `--run`, only prints the plan of the rolling deploy and says `dry run: nothing changed`. The stack, the load harness inside the lab network and the four tests tagged `stack` need Docker; the notes that describe them say whether their commands were run.
+`check` runs 152 tests with a line coverage of 93.4 percent (1,610 of 1,723 lines), version 1.1.0. `stackFiles` collects the eleven jars that the container image copies into `build/stack/lib`. The `deploy` task, without `--run`, only prints the plan of the rolling deploy and says `dry run: nothing changed`. The stack, the load harness inside the lab network and the six tests tagged `stack` need Docker; the notes that describe them say whether their commands were run.
 
 One warning: never give `--run` to the `deploy` task while someone else's stack is up on this machine. The tool talks to the balancers on `127.0.0.1` ports 21005 and 21015 and restarts real containers of the Compose project `seatwave-balancer`.
 

@@ -531,7 +531,7 @@ Each setting of the pool.
 - `setInitializationFailTimeout(-1)`: a negative number means "start without trying to connect". The comment: start without the database instead of failing; readiness tells the balancer.
 - `new HikariDataSource(config)` creates the pool.
 
-Hikari's own limits are stricter than `ServiceSettings`. Hikari throws `IllegalArgumentException("connectionTimeout cannot be less than 250ms")` for any connection timeout under 250 ms, and the same kind of error for a validation timeout under 250 ms. `ServiceSettings` accepts `db.connectTimeoutMillis` from 1. `DatabasePool.open` catches only `IOException`, so a settings file with a value from 1 to 249 starts the program, throws out of `main`, prints a stack trace and exits with status 1. The validation timeout cannot hit the limit, because the settings enforce at least 1,000 ms for it. This is a real defect and a test would catch it; the project has none.
+Hikari has limits of its own. It throws `IllegalArgumentException("connectionTimeout cannot be less than 250ms")` for any connection timeout under 250 ms, and the same kind of error for a validation timeout under 250 ms. `DatabasePool.open` catches only `IOException`, so such a value would throw out of `main` with a stack trace. The settings keep both values inside Hikari's limits before this method runs: `ServiceSettings` accepts `db.connectTimeoutMillis` from 250 (`MIN_CONNECT_MILLIS`, see part 1) and `readiness.checkTimeoutMillis` from 1,000. `ServiceSettingsTest.opensThePoolWithTheShortestConnectTimeoutTheSettingsAllow` opens a real pool with 250 and reads `getConnectionTimeout()` back as 250. Version 1.0.0 accepted 1 and crashed at start for 1 to 249.
 
 ### `seatwave/ServiceMetrics.java`
 
@@ -555,6 +555,9 @@ import java.util.concurrent.atomic.LongAdder;
  * by route and status, a duration histogram, requests refused because the instance was not ready,
  * requests refused by a full queue, and the lifecycle's state and in-flight count.
  *
+ * <p>Every line ends in {@code \n}, never the platform's line separator: the text format is the
+ * same on every machine.
+ *
  * <p>The labels are the route template and the status, never a raw path or a client address, so the
  * number of series stays small (the guidelines' rule 68). Thread-safe: every field is a concurrent
  * counter.
@@ -567,7 +570,7 @@ final class ServiceMetrics {
   private static final double NANOS_PER_SECOND = 1_000_000_000.0;
 ```
 
-The Javadoc lists what is counted: requests by route and status, a duration histogram, requests refused because the instance was not ready, requests refused by a full queue, and the lifecycle state and in-flight count. The labels are "the route template and the status, never a raw path or a client address, so the number of series stays small". Each distinct label combination is a separate series that the monitoring system stores; a label with a hold id in it would create one series per hold and drown it.
+The Javadoc lists what is counted: requests by route and status, a duration histogram, requests refused because the instance was not ready, requests refused by a full queue, and the lifecycle state and in-flight count. Its second paragraph makes a promise about line ends: every line ends in `\n` (the line feed character), never the platform's line separator, so the text is the same on every machine. `{@code \n}` is how Javadoc shows a piece of code. The reason is below, where `render` writes the lines. The labels are "the route template and the status, never a raw path or a client address, so the number of series stays small". Each distinct label combination is a separate series that the monitoring system stores; a label with a hold id in it would create one series per hold and drown it.
 
 `BUCKET_SECONDS` lists the upper limits of the histogram in seconds: 1 ms, 2.5 ms, 5 ms, 10 ms, 25 ms, 50 ms, 100 ms, 250 ms, 500 ms, 1 s and 2.5 s. `NANOS_PER_SECOND` converts nanoseconds to seconds.
 
@@ -642,7 +645,7 @@ Three tiny methods: count one request that was not admitted, count one that the 
       text.append(
           String.format(
               Locale.ROOT,
-              "seatwave_requests_total{route=\"%s\",status=\"%s\"} %d%n",
+              "seatwave_requests_total{route=\"%s\",status=\"%s\"} %d\n",
               key.substring(0, bar),
               key.substring(bar + 1),
               count));
@@ -650,14 +653,14 @@ Three tiny methods: count one request that was not admitted, count one that the 
     text.append("# TYPE seatwave_request_seconds histogram\n");
 ```
 
-`render` builds the `/metrics` text with a `StringBuilder`. First the request counters. They are copied into a `TreeMap`, so the lines come out in sorted order every time. For each entry, `key.lastIndexOf('|')` finds the last bar (the route has spaces and slashes but no bar), and `String.format` writes `seatwave_requests_total{route="POST /v1/holds",status="503"} 3`. `Locale.ROOT` fixes the number formatting. `%d` is a whole number, `%s` a text, `%n` the platform's line break.
+`render` builds the `/metrics` text with a `StringBuilder`. First the request counters. They are copied into a `TreeMap`, so the lines come out in sorted order every time. For each entry, `key.lastIndexOf('|')` finds the last bar (the route has spaces and slashes but no bar), and `String.format` writes `seatwave_requests_total{route="POST /v1/holds",status="503"} 3`. `Locale.ROOT` fixes the number formatting. `%d` is a whole number, `%s` a text, and `\n` at the end is a line feed, written into the format text itself. `String.format` also knows `%n`, the line separator of the machine it runs on: a line feed on Linux and macOS, but a carriage return plus a line feed on Windows. The Prometheus text format wants a plain line feed, so `%n` would make the output depend on the machine. Version 1.0.0 used `%n` here; version 1.1.0 writes `\n` in every line.
 
 ```java
     for (int bucketIndex = 0; bucketIndex < bucketCounts.length; bucketIndex++) {
       text.append(
           String.format(
               Locale.ROOT,
-              "seatwave_request_seconds_bucket{le=\"%s\"} %d%n",
+              "seatwave_request_seconds_bucket{le=\"%s\"} %d\n",
               BUCKET_SECONDS.get(bucketIndex),
               bucketCounts[bucketIndex].sum()));
     }
@@ -668,13 +671,13 @@ The histogram lines, one for each limit: `seatwave_request_seconds_bucket{le="0.
 
 ```java
     text.append(
-        String.format(Locale.ROOT, "seatwave_request_seconds_bucket{le=\"+Inf\"} %d%n", count));
+        String.format(Locale.ROOT, "seatwave_request_seconds_bucket{le=\"+Inf\"} %d\n", count));
     text.append(
         String.format(
             Locale.ROOT,
-            "seatwave_request_seconds_sum %.6f%n",
+            "seatwave_request_seconds_sum %.6f\n",
             durationNanos.sum() / NANOS_PER_SECOND));
-    text.append(String.format(Locale.ROOT, "seatwave_request_seconds_count %d%n", count));
+    text.append(String.format(Locale.ROOT, "seatwave_request_seconds_count %d\n", count));
     line(text, "counter", "seatwave_not_admitted_total", notAdmitted.sum());
 ```
 
@@ -696,7 +699,7 @@ The queue-full counter and the in-flight gauge (`lifecycle.inFlight()`) are writ
       text.append(
           String.format(
               Locale.ROOT,
-              "seatwave_state{state=\"%s\"} %d%n",
+              "seatwave_state{state=\"%s\"} %d\n",
               state.name().toLowerCase(Locale.ROOT),
               state == current ? 1 : 0));
     }
@@ -714,7 +717,7 @@ The state gauge. For every value of `LifecycleState`, one line with a value of 1
 }
 ```
 
-`line` writes a `# TYPE` line (which tells the reader whether the metric is a counter or a gauge) and one value line. It joins pieces with `append`. A note for a reader who cares: this helper ends lines with `\n`, while the others use `%n`. On Linux and macOS they are the same character. On Windows `%n` is a carriage return plus a line feed, which the Prometheus text format does not allow, so the two styles should be one.
+`line` writes a `# TYPE` line (which tells the reader whether the metric is a counter or a gauge) and one value line. It joins pieces with `append`, and it ends each line with `'\n'`, the same line feed as the formatted lines above.
 
 One more note: the buckets, the count and the sum are read at slightly different moments, so a scrape taken during traffic can show a bucket and a total that disagree by a request or two. That is normal for counters read without a lock.
 
@@ -790,7 +793,7 @@ The class comment gives the whole life of the program: read the settings, open t
 
 1. `start(arguments, System.out, System.err)` returns an `Optional<Running>`. Empty means it printed why it could not start, so `main` calls `System.exit(2)`.
 2. `CountDownLatch stopped = new CountDownLatch(1)` is a gate that opens after one `countDown()`.
-3. `Runtime.getRuntime().addShutdownHook(new Thread(...))` registers a thread that the JVM starts when the process is asked to stop. The comment explains why this is enough: the JVM runs the hook on SIGTERM and waits for it, so the drain finishes before the process exits; and `docker stop` waits longer than the drain deadline (`stop_grace_period: 30s` in `compose.yaml`, against `drain.deadlineMillis=20000`), so Docker does not kill the instance in the middle of a drain.
+3. `Runtime.getRuntime().addShutdownHook(new Thread(...))` registers a thread that the JVM starts when the process is asked to stop. The comment explains why this is enough: the JVM runs the hook on SIGTERM and waits for it, so the drain finishes before the process exits; and `docker stop` waits longer than the drain deadline (`stop_grace_period: 30s` in `compose.yaml`, against `drain.deadlineMillis=20000`), so Docker does not kill the instance in the middle of a drain. Even the worst case fits: a request still running at the deadline gets `SeatWaveServer.WORKER_STOP_WAIT` (5 seconds) more, so the longest stop is 25 seconds, inside the 30.
 4. `stopped.await()` blocks the main thread until the hook has finished the drain, so `main` returns only after the instance has stopped. The hook opens the gate after `stop` is done.
 
 The program stays alive until SIGTERM. The status then is 143, the number of the signal plus 128: the shell's way to report "killed by signal 15".
@@ -806,12 +809,12 @@ The program stays alive until SIGTERM. The status then is 143, the number of the
    */
   static Optional<Running> start(String[] arguments, PrintStream out, PrintStream err) {
     if (arguments.length != 2 || !INSTANCE_NAME.matcher(arguments[1]).matches()) {
-      err.println("usage: serve <seatwave.properties> <instance name, such as seatwave-1>");
+      err.println("usage: SeatWaveCli <seatwave.properties> <instance name, such as seatwave-1>");
       return Optional.empty();
     }
 ```
 
-`start` is separate from `main` so a test can call it. The Javadoc says it checks the arguments and the settings, opens the pool and starts the listeners. First check: exactly two arguments and a name that fits `INSTANCE_NAME`, else print the usage line and return empty. (The usage line begins with the word `serve`, a name from an earlier project; nothing in this project is called `serve`. The container runs the class directly. It is a small misleading word in the message.)
+`start` is separate from `main` so a test can call it. The Javadoc says it checks the arguments and the settings, opens the pool and starts the listeners. First check: exactly two arguments and a name that fits `INSTANCE_NAME`, else print the usage line and return empty. The usage line names the program as it is run, `SeatWaveCli`, then the two arguments in angle brackets, the usual way to mark a value the user fills in. (Version 1.0.0 printed `usage: serve`, a name from an earlier project.)
 
 ```java
     Optional<ServiceSettings> loaded =
@@ -913,9 +916,9 @@ All commands run in the project folder; timings and ids differ on every run. The
 ./gradlew --offline cleanTest test --tests '*JdbcHoldStoreTest' 2>&1 | grep -E "FAILED|BUILD"
 ```
 
-The only line printed is `BUILD SUCCESSFUL`. Thirteen tests ran; leave out the `grep` to see their names.
+The only line printed is `BUILD SUCCESSFUL`. Fifteen tests ran; leave out the `grep` to see their names.
 
-2. See the connection timeout rough edge. This needs the files from `./gradlew --offline -q stackFiles`, and a settings file as made in part 2 (`build/try/local.properties`).
+2. See the connection timeout floor. This needs the files from `./gradlew --offline -q stackFiles`, and a settings file as made in part 2 (`build/try/local.properties`).
 
 ```bash
 sed -e 's#^db.connectTimeoutMillis=.*#db.connectTimeoutMillis=100#' build/try/local.properties > build/try/fast.properties
@@ -923,13 +926,11 @@ java -cp 'build/stack/lib/*' io.plainround.seatwave.balancer.seatwave.SeatWaveCl
 ```
 
 ```text
-Exception in thread "main" java.lang.IllegalArgumentException: connectionTimeout cannot be less than 250ms
-	at com.zaxxer.hikari.HikariConfig.setConnectionTimeout(HikariConfig.java:195)
-	at io.plainround.seatwave.balancer.seatwave.DatabasePool.open(DatabasePool.java:48)
-	at io.plainround.seatwave.balancer.seatwave.SeatWaveCli.start(SeatWaveCli.java:76)
+the settings in build/try/fast.properties have 1 problem(s):
+  db.connectTimeoutMillis must be from 250 to 600000, but was 100
 ```
 
-The shell's exit status for this run is 1, not the documented 2.
+The shell's exit status for this run is 2, the documented status for an invalid settings file. The value never reaches the pool. (Version 1.0.0 accepted it and crashed inside Hikari with a stack trace and status 1.)
 
 3. Start the instance with no database (as in part 2), send three holds, and read the metrics. Each request waits for the pool's connection timeout (1,000 ms in this file) before it fails, so all three land in the 2.5 second bucket and the sum is a little over three seconds.
 
@@ -946,7 +947,7 @@ kill -TERM $PID; wait $PID; echo "exit $?"
 seatwave_request_seconds_bucket{le="1.0"} 0
 seatwave_request_seconds_bucket{le="2.5"} 3
 seatwave_request_seconds_bucket{le="+Inf"} 3
-seatwave_request_seconds_sum 3.104767
+seatwave_request_seconds_sum 3.062711
 seatwave_request_seconds_count 3
 exit 143
 ```
@@ -966,10 +967,10 @@ for p in t.findall('package'):
 ```
 
 ```text
-[98, 99, 100, 101, 105, 106, 107, 108, 109]
+[101, 107]
 ```
 
-Those are the lines of the duplicate-key recovery in `hold`.
+Both lines are in the duplicate-key recovery of `hold`. Line 101 is `throw failure;`, the path for an `SQLException` that is not a unique violation; line 107 is the lambda that builds the exception for "a duplicate key without a hold", which can only happen if the database broke its own rule. The recovery itself is now tested: `JdbcHoldStoreTest` reaches it with the stand-in connections of `JdbcStandIns.java`.
 
 ## Mistakes people make
 
@@ -979,7 +980,7 @@ Those are the lines of the duplicate-key recovery in `hold`.
 - **Forgetting the rollback in PostgreSQL.** After a failed statement the transaction is unusable until it is rolled back; reading before the rollback would fail again.
 - **Reading times in the machine's time zone.** The store passes `OffsetDateTime` at UTC and reads `OffsetDateTime` back.
 - **A pool that grows with load.** More connections than the database can serve makes everything slower. This pool is fixed, and `ServiceSettings` refuses a pool larger than the worker threads.
-- **A settings rule looser than the library's.** See step 2 above.
+- **A settings rule looser than the library's.** Version 1.0.0 had one; step 2 above shows the rule that replaced it.
 - **Metrics labels with unbounded values.** The label is the route template, never the path.
 - **Closing the pool before the drain ends.** `stop` drains first.
 

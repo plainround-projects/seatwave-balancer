@@ -78,12 +78,12 @@ x-hardening: &hardening
 - `security_opt: - no-new-privileges:true` forbids a process in the container, and its children, from gaining more rights than it started with (for example through a program with the setuid bit).
 - `read_only: true` makes the container's root file system read-only. I checked it in a SeatWave instance: `touch /app/x` answered `Read-only file system`. A program that must write somewhere gets a `tmpfs` or a mounted folder for that one place.
 
-`compose.yaml`, lines 21 to 39:
+`compose.yaml`, lines 21 to 41:
 
 ```yaml
 x-seatwave: &seatwave
   <<: *hardening
-  image: seatwave-balancer-seatwave:1.0.0
+  image: seatwave-balancer-seatwave:1.1.0
   cap_drop:
     - ALL
   # Two CPUs and 512 MB each: three instances, two balancers, the database and the harness share
@@ -97,22 +97,24 @@ x-seatwave: &seatwave
   depends_on:
     postgres:
       condition: service_healthy
-  # Longer than drain.deadlineMillis (20 s): docker stop sends SIGTERM, waits this long, then
-  # SIGKILL, so a draining instance is never killed by docker.
+  # docker stop sends SIGTERM, waits this long, then SIGKILL. The worst-case stop of an instance is
+  # drain.deadlineMillis (20 s, config/seatwave-container.properties) plus the 5 s it then gives
+  # its worker threads (SeatWaveServer.WORKER_STOP_WAIT): 25 s, inside these 30 s, so a draining
+  # instance is never killed by docker. ServiceSettingsTest checks the arithmetic.
   stop_grace_period: 30s
 ```
 `x-seatwave` (anchor `seatwave`) holds everything the three instances share.
 
 - `<<: *hardening` merges the two settings above into this block.
-- `image: seatwave-balancer-seatwave:1.0.0` is the image the `Dockerfile` builds (only `seatwave-1` has the `build:` key; the other two reuse the image the first one builds).
+- `image: seatwave-balancer-seatwave:1.1.0` is the image the `Dockerfile` builds (only `seatwave-1` has the `build:` key; the other two reuse the image the first one builds).
 - `cap_drop: - ALL` removes every Linux capability from the container. SeatWave needs none: it opens ports above 1024.
 - The comment says why the limits are what they are: three instances, two balancers, the database and the harness share the Docker virtual machine's 12 CPUs. `cpus: 2` caps the container at two CPUs' worth of time, and `mem_limit: 512m` caps its memory at 512 megabytes (the Java heap may use half of it, see `docker.md`).
 - `tmpfs: - /tmp` gives the container an in-memory `/tmp`, because the root file system is read-only and a program may want a writable temporary folder.
 - `secrets: - db_password` mounts the secret named at the bottom of the file, at `/run/secrets/db_password`. The settings file points at it with `db.passwordFile` (see `java-properties.md`).
 - `depends_on:` with `postgres:` and `condition: service_healthy` makes Compose start an instance only after the database's health check (below) reports healthy. The plain list form of `depends_on` would only order the starts.
-- The last comment and `stop_grace_period: 30s` go together. `drain.deadlineMillis` in the settings is 20 seconds. `docker stop` sends SIGTERM, waits this long, then sends SIGKILL, so a draining instance is never killed by Docker before its own deadline.
+- The last comment and `stop_grace_period: 30s` go together. `docker stop` sends SIGTERM (the polite "please stop" signal), waits this long, then sends SIGKILL (the signal that ends a process at once, with no clean-up). The comment adds up the worst case of a stopping instance: `drain.deadlineMillis` in `config/seatwave-container.properties` is 20 seconds, the longest the instance waits for its in-flight requests, and after that it gives its worker threads 5 more seconds to finish (the constant `WORKER_STOP_WAIT` in `SeatWaveServer`). 20 + 5 = 25 seconds, which is inside the 30, so a draining instance is never killed by Docker before its own deadline. `ServiceSettingsTest` reads both files and checks this sum, so changing one number without the other fails the build (`tests-seatwave-walkthrough-1.md` explains the test).
 
-`compose.yaml`, lines 41 to 52:
+`compose.yaml`, lines 43 to 54:
 
 ```yaml
 x-balancer: &balancer
@@ -135,13 +137,13 @@ x-balancer: &balancer
 - `cpus: 1` and `mem_limit: 256m` are the limits. The comment ties the one CPU to `nbthread 1` in `haproxy.cfg`: HAProxy runs one thread on one CPU, so every balancer number in the module is per core.
 - `volumes: - ./haproxy/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro` is a bind mount, written `host path : container path : options`. `:ro` means read-only. `/usr/local/etc/haproxy/haproxy.cfg` is the path where the official image looks for its configuration, so no command line is needed.
 
-`compose.yaml`, lines 54 to 71:
+`compose.yaml`, lines 56 to 73:
 
 ```yaml
 x-keepalived: &keepalived
   <<: *hardening
   build: ./keepalived
-  image: seatwave-balancer-keepalived:1.0.0
+  image: seatwave-balancer-keepalived:1.1.0
   # NET_ADMIN adds and removes the floating address; NET_RAW sends VRRP; SETUID and SETGID let it
   # run its check script as the script user. Nothing else.
   cap_drop:
@@ -166,7 +168,7 @@ x-keepalived: &keepalived
 
 ### The `services:` key and the database
 
-`compose.yaml`, lines 73 to 110:
+`compose.yaml`, lines 75 to 112:
 
 ```yaml
 services:
@@ -220,7 +222,7 @@ services:
 
 ### The three SeatWave instances
 
-`compose.yaml`, lines 112 to 132:
+`compose.yaml`, lines 114 to 134:
 
 ```yaml
   seatwave-1:
@@ -253,7 +255,7 @@ services:
 
 ### The two balancers
 
-`compose.yaml`, lines 134 to 162:
+`compose.yaml`, lines 136 to 164:
 
 ```yaml
   lb1:
@@ -293,7 +295,7 @@ services:
 
 ### The keepalived services
 
-`compose.yaml`, lines 164 to 181:
+`compose.yaml`, lines 166 to 183:
 
 ```yaml
   # Each keepalived shares its balancer's network namespace, as a second process on the same
@@ -323,7 +325,7 @@ services:
 
 ### The harness
 
-`compose.yaml`, lines 183 to 200:
+`compose.yaml`, lines 185 to 202:
 
 ```yaml
   # The harness, inside the lab network: the floating address exists only there, and timings
@@ -331,7 +333,7 @@ services:
   # (docker compose run --rm harness <settings>); it publishes no port.
   harness:
     <<: *hardening
-    image: seatwave-balancer-seatwave:1.0.0
+    image: seatwave-balancer-seatwave:1.1.0
     profiles:
       - tools
     entrypoint: ["/opt/seatwave-java/bin/java", "-cp", "/app/lib/*", "io.plainround.seatwave.balancer.harness.HarnessCli"]
@@ -352,7 +354,7 @@ services:
 
 ### The secret, the volume and the network
 
-`compose.yaml`, lines 202 to 213:
+`compose.yaml`, lines 204 to 215:
 
 ```yaml
 secrets:
@@ -374,7 +376,7 @@ networks:
 
 ## Try it yourself
 
-I ran these on 11 November 2026 with Docker 24.0.6 and Compose v2.23.0-desktop.1 in a copy of the repository, using the project name `seatwave-balancer-notes` and renamed image tags (see `docker.md`). With the repository as it is, leave `-p` out or use `-p seatwave-balancer`. The stack was up. Timings differ on every machine.
+I ran these on 11 November 2026 with Docker 24.0.6 and Compose v2.23.0-desktop.1 in a copy of the repository at version 1.0.0 (the old run), using the project name `seatwave-balancer-notes` and renamed image tags (see `docker.md`). Steps 1 and 2 show the re-measured run of version 1.1.0 instead, made with the real project name `seatwave-balancer`. With the repository as it is, leave `-p` out or use `-p seatwave-balancer`. The stack was up. Timings differ on every machine.
 
 1. Start the stack (the first time it also builds the images; later runs take seconds) and read the last line:
 
@@ -385,28 +387,28 @@ scripts/stack.sh up --run --yes 2>&1 | tail -1
 Output:
 
 ```
-stack is up after 5 s: 3 of 3 instances up on lb1 and lb2; 10.210.10.100 on keepalived-2
+stack is up after 4 s: 3 of 3 instances up on lb1 and lb2; 10.210.10.100 on keepalived-1
 ```
 
-(The last word can be `keepalived-1` on another start: see `keepalived-vrrp.md`.)
+(The last word can be `keepalived-2` on another start: the keepalived that starts first usually takes the address, see `keepalived-vrrp.md`.)
 
 2. List the containers, with the digests cut off:
 
 ```
-docker compose -p seatwave-balancer-notes ps --format '{{.Service}}  {{.Image}}  {{.Status}}' | sed 's/@sha256:[0-9a-f]*//'
+docker compose -p seatwave-balancer ps --format '{{.Service}}  {{.Image}}  {{.Status}}' | sed 's/@sha256:[0-9a-f]*//'
 ```
 
 Output:
 
 ```
-keepalived-1  seatwave-balancer-notes-keepalived:1.0.0  Up 21 seconds
-keepalived-2  seatwave-balancer-notes-keepalived:1.0.0  Up 21 seconds
-lb1  haproxy:3.4.7  Up 21 seconds
-lb2  haproxy:3.4.7  Up 21 seconds
-postgres  postgres:18.6  Up 21 seconds (healthy)
-seatwave-1  seatwave-balancer-notes-seatwave:1.0.0  Up 18 seconds
-seatwave-2  seatwave-balancer-notes-seatwave:1.0.0  Up 18 seconds
-seatwave-3  seatwave-balancer-notes-seatwave:1.0.0  Up 18 seconds
+keepalived-1  seatwave-balancer-keepalived:1.1.0  Up 7 seconds
+keepalived-2  seatwave-balancer-keepalived:1.1.0  Up 7 seconds
+lb1  haproxy:3.4.7  Up 7 seconds
+lb2  haproxy:3.4.7  Up 7 seconds
+postgres  postgres:18.6  Up 7 seconds (healthy)
+seatwave-1  seatwave-balancer-seatwave:1.1.0  Up 4 seconds
+seatwave-2  seatwave-balancer-seatwave:1.1.0  Up 4 seconds
+seatwave-3  seatwave-balancer-seatwave:1.1.0  Up 4 seconds
 ```
 
 3. See what the anchors and merges produced. `docker compose config` prints the file after Compose has applied them. Here the limits of three services:

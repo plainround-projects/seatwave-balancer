@@ -71,7 +71,7 @@ global
 
 ### `defaults`
 
-`haproxy/haproxy.cfg`, lines 17 to 35:
+`haproxy/haproxy.cfg`, lines 17 to 44:
 
 ```text
 defaults
@@ -86,12 +86,21 @@ defaults
   # is not a failure.
   timeout connect 2s
   timeout client 30s
+  # The whole request head must arrive within 5 s of the request's start, so a client that sends
+  # its headers a byte at a time (a slow-headers attack) holds a connection 5 s at most; without
+  # it, every byte would restart the 30 s client timeout. A fan's request head is one packet.
+  timeout http-request 5s
   # Above SeatWave's slowest honest answer (a hold, a few milliseconds) with a wide margin.
   timeout server 10s
   timeout http-keep-alive 10s
   timeout queue 2s
-  # A check that takes longer than 1 s counts as failed, so a hung instance is caught within the
-  # same budget as a dead one.
+  # With "timeout check" set, a check's connect waits min(timeout connect, inter), here 2 s, and
+  # "timeout check" is the extra wait for the answer (configuration manual, "timeout check"). So a
+  # dead instance, whose address no longer answers, fails each check after the 2 s connect wait,
+  # and a hung one, which accepts the connection but never answers, after 1 s more than the
+  # connect took. HAProxy schedules the next check 2 s (inter) after one ends: about 4 s from one
+  # failed check of a dead instance to the next, so "fall 3" takes about 12 s, which the
+  # active-only kill run measures.
   timeout check 1s
 ```
 - `defaults` opens a section of settings that every frontend, backend and listen section after it inherits.
@@ -109,14 +118,19 @@ defaults
 - `option dontlognull` suppresses the line for a connection that sent no data at all (a port scan, or a check).
 - `timeout connect 2s` is how long HAProxy waits to establish a connection to a server. The comment says why 2 seconds: it is above one TCP retransmission (1 s). When a connection request (a SYN packet) is lost, the operating system tries again after 1 second, so one lost packet must not count as a failure. This is also the figure that decides how long a **dead** server takes to be detected: see `timeout check` below.
 - `timeout client 30s` closes a client connection that has been silent for 30 seconds.
+- The three comment lines above `timeout http-request 5s` explain it. The **request head** is the first part of an HTTP request: the request line (`POST /v1/holds HTTP/1.1`) and the headers, up to the empty line that ends them. `timeout http-request 5s` says the whole head must arrive within 5 seconds of the request's start. Without it, only `timeout client` would apply, and that one restarts every time a byte arrives. A client that sends its headers one byte every few seconds (a **slow-headers attack**, a way to tie up a server's connections with very little traffic of one's own) could then hold a connection open for as long as it likes. With the line, such a client holds a connection 5 seconds at most. A real fan's request head is small and arrives in one packet, so the limit never touches honest traffic. The same 5 seconds also bound the wait for the next request on a kept-alive connection, but `timeout http-keep-alive 10s` below is the setting for that case, and HAProxy uses `http-keep-alive` there when both are set.
 - `timeout server 10s` gives a server 10 seconds of silence before HAProxy gives up on its answer. The comment says the longest honest SeatWave answer is a few milliseconds, so 10 s is a wide margin.
 - `timeout http-keep-alive 10s` is how long HAProxy keeps a connection open, waiting for the client's next request on it. It applies only between requests on a connection that is being reused.
 - `timeout queue 2s` is how long a request may wait for a free server slot. No server here has a connection limit, so nothing ever waits in a queue; the line only sets a bound.
-- `timeout check 1s`: an extra time limit for a health check, counted after the connection is made. The comment says a check that takes longer than 1 s counts as failed, so a hung instance (one that accepts the connection but never answers) is caught within a budget close to that of a dead one. A dead instance is slower to catch than a hung one: the connect part of a check is limited by `timeout connect` (2 s), not by 1 s, because HAProxy uses the smaller of `timeout connect` and the check interval for the connect part and `timeout check` for the answer. In the log of this lab a check on the killed instance said `Layer4 timeout, check duration: 2001ms`. So the comment's "same budget" holds for the answer part only.
+- The seven comment lines above `timeout check 1s` and the line itself say exactly how long a health check may take. With `timeout check` set, HAProxy limits the connect part of a check to the smaller of `timeout connect` and `inter` (the check interval, set to 2 s further down), so here min(2 s, 2 s) = 2 s, and `timeout check` (1 s) is the extra wait for the answer once the connection is made. The configuration manual says this under its entry "timeout check". Two cases follow from it:
+  - A **dead** instance: its address no longer answers at all, so the connection is never made. Each check fails after the 2 s connect wait. In this lab's log a check on the killed instance said `Layer4 timeout, check duration: 2000ms` (Layer 4 is the connection level).
+  - A **hung** instance: it accepts the connection but never answers. Each check fails 1 s after the connection was made.
+  - HAProxy schedules the next check 2 s (`inter`) after one ends. So the failed checks of a dead instance come about 4 s apart (2 s of waiting plus 2 s of interval), and `fall 3` (three failures in a row, set below) takes about 12 s. The active-only kill run measures that; the end of the PRODUCTION section below gives the numbers.
+  - Version 1.0.0's comment said a check slower than 1 s fails "within the same budget as a dead one". That was true only for the answer part, because the connect part waits 2 s. The new comment states both parts.
 
 ### `frontend public`
 
-`haproxy/haproxy.cfg`, lines 37 to 51:
+`haproxy/haproxy.cfg`, lines 46 to 60:
 
 ```text
 frontend public
@@ -145,7 +159,7 @@ frontend public
 
 ### `backend seatwave`: PRODUCTION
 
-`haproxy/haproxy.cfg`, lines 53 to 71:
+`haproxy/haproxy.cfg`, lines 62 to 84:
 
 ```text
 # PRODUCTION. Round robin; an active check of /ready every 2 s, down after 3 failures, up after
@@ -159,9 +173,13 @@ backend seatwave
   # Two more attempts, each on another instance (redispatch on every retry).
   retries 2
   option redispatch 1
-  # Retried only when SeatWave did no work (no connection, or its 503 "not ready, nothing done")
-  # or when the connection died before any byte of an answer. A hold carries an Idempotency-Key,
-  # so even the last case cannot hold a seat twice: the shared database replays the first hold.
+  # Retried on three events. conn-failure: no connection was made, so SeatWave saw nothing. 503:
+  # SeatWave's own "not ready, nothing was done", or the shared database down, where nothing was
+  # done either. empty-response: the connection closed before any byte of an answer, after the
+  # request was sent, so the instance MAY have done the work. That last case is safe for a hold
+  # only because it carries an Idempotency-Key: the retry on another instance finds the hold the
+  # first one committed and replays it, and a hold the first one did not commit is made once. A
+  # GET is safe to repeat in every case.
   retry-on conn-failure empty-response 503
   default-server check port 8081 inter 2s fall 3 rise 2 slowstart 10s observe layer4 error-limit 3 on-error mark-down
   server seatwave-1 10.210.10.11:8080
@@ -174,7 +192,10 @@ backend seatwave
 - `option httpchk` makes the health check an HTTP request instead of a plain connection. `http-check send meth GET uri /ready` sets what to send (the method `GET`, the path `/ready`). `http-check expect status 200` sets the answer that counts as healthy: status 200. Any other status, or no answer, is a failure. `/ready` is a different endpoint from `/health` on purpose: a draining instance is alive but not ready, and the balancer must stop sending it work (see `java-seatwave-walkthrough-1.md`, `java-seatwave-walkthrough-2.md` and `java-seatwave-walkthrough-3.md`).
 - `retries 2` allows two more tries after the first. A request that cannot be served by the first server is tried again, at most twice more.
 - `option redispatch 1` says where the retry goes. The comment above says "each on another instance (redispatch on every retry)". The number 1 means "on every retry"; without redispatch a retry would go to the same server.
-- The three comment lines above `retry-on` explain the rule. `retry-on conn-failure empty-response 503` lists the events that allow a retry: `conn-failure` (the connection to the server could not be made), `empty-response` (the server closed the connection before sending any byte of an answer) and `503` (the server answered with status 503). The comment's argument: in the first and third cases SeatWave did no work, because a SeatWave instance answers 503 only when it is not ready, and its body says so. In the second case the work may have been done, but a hold carries an `Idempotency-Key`, so even then a repeat cannot hold a seat twice: the shared database replays the first hold. Other retry events, such as a response timeout, are left out on purpose, and `InfrastructureRulesTest` checks that `response-timeout` and `junk-response` are not in the line.
+- The seven comment lines above `retry-on` explain the rule, one event at a time. `retry-on conn-failure empty-response 503` lists the events that allow a retry:
+  - `conn-failure`: the connection to the server could not be made. SeatWave saw nothing, so nothing was done.
+  - `503`: the server answered with status 503. A SeatWave instance answers 503 in two cases: its own "not ready, nothing was done" while it starts or drains, and the case where the shared database is down. Nothing was done in either case.
+  - `empty-response`: the connection closed before any byte of an answer came back, **after** the request was sent. This is the one case where the instance **may** have done the work: it may have committed a hold and died before it could answer. The comment says why a retry is still safe. A hold carries an `Idempotency-Key` (a unique name the client gives the request, see `load-balancing-concepts.md`). The retry goes to another instance, which looks the key up in the shared database: if the first instance committed the hold, the second finds it and replays the same answer; if the first did not commit it, the hold is made once, now. Either way a seat is never held twice. A `GET` only reads, so repeating it is safe in every case. Other retry events, such as a response timeout, are left out on purpose, and `InfrastructureRulesTest` checks that `response-timeout` and `junk-response` are not in the line.
 - `default-server check port 8081 inter 2s fall 3 rise 2 slowstart 10s observe layer4 error-limit 3 on-error mark-down` sets defaults for the `server` lines that follow, one setting at a time:
   - `check` turns on the active health check for each server.
   - `port 8081` makes the check go to port 8081 of the server, not the port 8080 that carries requests. The instance serves `/health`, `/ready` and `/metrics` on its own port, with its own thread, so a flood of requests cannot starve the check (the comment in `config/seatwave-container.properties` says the `/health`, `/ready` and `/metrics` endpoints run on their own thread).
@@ -186,11 +207,11 @@ backend seatwave
   - `error-limit 3` and `on-error mark-down` say what to do about them: after 3 consecutive errors on real traffic, mark the server down at once, without waiting for the active checks.
 - The three `server` lines each give a name, an address and a port: `server seatwave-1 10.210.10.11:8080` is a server called `seatwave-1` at that address. The addresses are the fixed ones in `compose.yaml`. The defaults above apply to all three.
 
-How long does it take to notice a dead instance? The README's active-only run shows what the numbers mean in practice: the status went `UP`, then `UP 2/3`, `UP 1/3`, `DOWN`, about 4 seconds apart. Each failed check waited 2 s for the connection (`timeout connect`) and the next waited 2 s more (`inter`). So `fall 3` times about 4 s is about 12 s, and the README measured 11.82 s from the last answer to the removal. The passive check in this backend cut the same case to 13.4 ms in the README's run, because real requests failed fast and three failures came in quickly.
+How long does it take to notice a dead instance? The README's active-only run shows what the numbers mean in practice: the status went `UP`, then `UP 2/3`, `UP 1/3`, `DOWN`, at +12.5 s, +16.5 s and +20.5 s of the run, about 4 seconds apart. Each failed check waited 2 s for the connection (the connect wait of `timeout check`, explained above) and the next began 2 s later (`inter`). So `fall 3` takes about 12 s from the first check after the kill, and the re-measured run of version 1.1.0 found 10.87 s from the last answer to the removal. The kill fell between two checks: the instance's last answer was at +9.6 s, the first failed check had started about 0.85 s after that and ended 2 s later at +12.5 s, and two more 4 s steps brought `DOWN` at +20.5 s. The passive check in this backend cut the same case to 52.7 ms in that run, because real requests failed fast and three failures came in quickly.
 
 ### `backend seatwave_active_only`: SIMPLE
 
-`haproxy/haproxy.cfg`, lines 73 to 86:
+`haproxy/haproxy.cfg`, lines 86 to 99:
 
 ```text
 # SIMPLE checks: the same active check, no passive check, no retries, no slow start. This is the
@@ -208,7 +229,7 @@ backend seatwave_active_only
   server seatwave-2 10.210.10.12:8080
   server seatwave-3 10.210.10.13:8080
 ```
-- The comment says what this backend is for: the same active check, no passive check, no retries, no slow start. It is the backend whose losses Little's Law predicts: every request sent to a dead instance before the check notices fails. (Little's Law says that the average number in a system equals the arrival rate times the average time in the system. Here: 3,000 requests a second, times one third of them going to the dead instance, times 11.8 seconds before it is removed, is about 11,800 failures, and the README shows 11,777.)
+- The comment says what this backend is for: the same active check, no passive check, no retries, no slow start. It is the backend whose losses Little's Law predicts: every request sent to a dead instance before the check notices fails. (Little's Law says that the average number in a system equals the arrival rate times the average time in the system. Here: 3,000 requests a second, times one third of them going to the dead instance, times 10.872 seconds before it is removed, is 10,871 requests, as the report of the re-measured run prints. The same run counted 7,653 failed requests. The difference, 3,218, is the reads that the harness's own client tried once more on a new connection, as a fan's app would: the JDK client repeats a `GET` whose reused connection closed before any byte of the answer, never a `POST` (`java-harness-walkthrough-1.md` explains the harness).)
 - `balance roundrobin`, `option httpchk`, `http-check send ...` and `http-check expect ...` are the same as in PRODUCTION.
 - `retries 0` and `retry-on none` switch retries off. A request that cannot reach its server gets HAProxy's own 503 answer.
 - `default-server check port 8081 inter 2s fall 3 rise 2` has `check`, the port and the three numbers, but none of `slowstart`, `observe`, `error-limit` or `on-error`. `InfrastructureRulesTest` checks that this block contains none of `redispatch`, `observe` and `slowstart`.
@@ -216,7 +237,7 @@ backend seatwave_active_only
 
 ### The three algorithm backends
 
-`haproxy/haproxy.cfg`, lines 88 to 118:
+`haproxy/haproxy.cfg`, lines 101 to 131:
 
 ```text
 # The algorithms of Chapter 10.2. Their servers track PRODUCTION's, so they share its checks and
@@ -259,7 +280,7 @@ backend seatwave_weighted
 
 ### `listen status`
 
-`haproxy/haproxy.cfg`, lines 120 to 127:
+`haproxy/haproxy.cfg`, lines 133 to 140:
 
 ```text
 # The balancer's own health and its read-only statistics page. keepalived asks /healthz to decide
@@ -279,7 +300,7 @@ listen status
 
 ## Try it yourself
 
-I ran these on 11 November 2026 against the running stack (project name `seatwave-balancer-notes`). Counts and times differ on every run. Start the stack with `scripts/stack.sh up --run --yes`.
+I ran these on 11 November 2026 against the running stack of version 1.0.0 (the old run; project name `seatwave-balancer-notes`). Version 1.1.0 changed this file's comments and added `timeout http-request 5s`, which no request of these steps comes near, so the steps behave the same; the numbers quoted from the re-measured run of version 1.1.0 say so. Counts and times differ on every run. Start the stack with `scripts/stack.sh up --run --yes`.
 
 1. Send nine holds to each of three doors and count who answered. Port 21000 is PRODUCTION (round robin), 21001 least connections, 21003 source hashing:
 
@@ -341,7 +362,7 @@ docker compose -p seatwave-balancer-notes start seatwave-3
 
   My run printed, one status per second: `UP` until 3 seconds after the kill, `UP 2/3` for the next 5 seconds, `UP 1/3` for the next 4, and `DOWN` from 13 seconds after the kill. (The kill was at +3 s on my clock, and `DOWN` first showed at +16 s.) The traffic loop, which I cut after 14 seconds, had counted 437 requests: 341 with status 201, 89 with 409 and 7 with 503. The 503s are HAProxy's own answers to requests sent to the dead instance before it was removed. After `start`, the status goes `DOWN 1/2` and then `UP`; in my runs it was `UP` again when I looked 25 seconds later.
 
-4. The same kill against PRODUCTION: run the loop above with port 21000 and the backend name `seatwave` in the `awk`. My run printed `UP` until 2 seconds after the kill, `UP 2/3` once, and `DOWN` from 4 seconds after the kill. All 600 requests got 201 (318) or 409 (282): no failure. The passive check and the retries absorbed the kill. (The README's measurement at 3,000 requests a second shows 13.4 ms instead of 4 s, because there the failures arrive fast enough to reach the error limit at once.) Start the instance again afterwards.
+4. The same kill against PRODUCTION: run the loop above with port 21000 and the backend name `seatwave` in the `awk`. My run printed `UP` until 2 seconds after the kill, `UP 2/3` once, and `DOWN` from 4 seconds after the kill. All 600 requests got 201 (318) or 409 (282): no failure. The passive check and the retries absorbed the kill. (The re-measured run of version 1.1.0 at 3,000 requests a second shows 52.7 ms instead of 4 s, because there the failures arrive fast enough to reach the error limit at once.) Start the instance again afterwards.
 
 5. Look at the bytes of a failed request in the log, for the active-only door, right after step 3 (the log line is the one explained under `defaults`):
 

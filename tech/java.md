@@ -78,13 +78,19 @@ public final class SeatWaveServer {
   private static final int UNAVAILABLE = 503;
   // 0: the in-flight wait is the Lifecycle's job, done before the listeners are stopped.
   private static final int STOP_DELAY_SECONDS = 0;
-  private static final long WORKER_STOP_SECONDS = 5;
+  // After the drain, the longest wait for worker threads to end: a request past the drain
+  // deadline gets this long, then is interrupted. The worst-case stop is therefore the drain
+  // deadline plus this wait (ServiceSettingsTest checks compose.yaml's grace period covers it).
+  static final Duration WORKER_STOP_WAIT = Duration.ofSeconds(5);
+  // HEAD is answered like GET without a body (RFC 9110, Section 9.3.2); -1 tells the JDK server so.
+  private static final long NO_BODY = -1;
 ```
 
 - `public final class SeatWaveServer` is a public class that nobody can extend.
 - `private static final Logger LOG = ...` is a constant that only this class sees (`logging-slf4j-logback.md`).
 - `private static final int OK = 200;`, `NOT_FOUND` and `UNAVAILABLE` name HTTP status numbers so the code never has a bare `503` whose meaning must be guessed. The comment above `STOP_DELAY_SECONDS` gives the reason for its `0`.
-- `long` is a whole number of 64 bits, `int` one of 32 bits, `double` a number with a fraction. `5` is an `int`; `5L` would be a `long`. `WORKER_STOP_SECONDS` is a `long` because the method it feeds (`awaitTermination`) takes one.
+- `static final Duration WORKER_STOP_WAIT = Duration.ofSeconds(5);` has no `public` or `private`: it is package-private, so a test in the same package can read it. A `Duration` (feature 13 below) is an amount of time that carries its unit.
+- `long` is a whole number of 64 bits, `int` one of 32 bits, `double` a number with a fraction. `5` is an `int`; `5L` would be a `long`. `NO_BODY = -1` is a `long` because the method it feeds (`sendResponseHeaders`) takes the body length as one; `-1` is an `int` literal, and Java widens it to `long` without a cast, because every `int` fits in a `long`.
 
 ```java
 public final class SeatWaveCli {
@@ -636,12 +642,17 @@ An **anonymous class** defines and instantiates a class in one place, without a 
         @Override
         public void stop(String service) {
           calls.add("stop " + service);
-          BACKENDS.forEach(backend -> status.put(backend + "/" + service, "DOWN"));
+          if (readsUntilSeenDown == 0) {
+            BACKENDS.forEach(backend -> status.put(backend + "/" + service, "DOWN"));
+          } else {
+            readsLeft.put(service, readsUntilSeenDown);
+          }
         }
 
         @Override
         public void start(String service) {
           calls.add("start " + service);
+          calls.add("start " + service + " while " + status.get("seatwave/" + service));
           if (!staysDownAfterStart) {
             BACKENDS.forEach(backend -> status.put(backend + "/" + service, "UP"));
           }
@@ -650,7 +661,7 @@ An **anonymous class** defines and instantiates a class in one place, without a 
     }
 ```
 
-`new Containers() { ... }` makes a class on the spot that implements the interface `Containers` and gives its two methods a body: the test's stand-in records the call and changes what the fake balancer will report. `@Override` asks the compiler to check that the method really replaces one of the type it implements. `BACKENDS.forEach(backend -> status.put(...))` is a lambda passed to `forEach`, which runs it for every item.
+`new Containers() { ... }` makes a class on the spot that implements the interface `Containers` and gives its two methods a body: the test's stand-in records the call and changes what the fake balancer will report. `stop` marks the instance `DOWN` at once, or, when the test asked for it (`readsUntilSeenDown` above zero), only after that many reads of the balancer's table, as real checks take time. `start` records a second line with the status the instance had at that moment, so a test can prove the deploy waited until the instance was seen down before starting it. `@Override` asks the compiler to check that the method really replaces one of the type it implements. `BACKENDS.forEach(backend -> status.put(...))` is a lambda passed to `forEach`, which runs it for every item.
 
 #### 17. Threads, executors and the small concurrency tools
 
@@ -714,7 +725,7 @@ public final class Lifecycle {
   }
 ```
 
-A **lock** (`ReentrantLock`) lets one thread at a time run the code between `lock.lock()` and `lock.unlock()`. The state and the in-flight count change under the same lock, so "is it still ready?" and "count this request" are one step. A **condition** (`idle`) lets a thread wait inside the lock until another thread signals it: `idle.awaitNanos(remainingNanos)` gives up the lock and sleeps until `idle.signalAll()` (in `release`, when the count reaches zero) or until the time is up, and returns how much time is left. The `while` loop is there because a wait can wake up without a signal. The `finally` sets the state to `STOPPED` and unlocks on every path, including the interruption that `awaitNanos` can throw. `volatile` and `synchronized` are not used anywhere in this code: the lock covers every shared field.
+A **lock** (`ReentrantLock`) lets one thread at a time run the code between `lock.lock()` and `lock.unlock()`. The state and the in-flight count change under the same lock, so "is it still ready?" and "count this request" are one step. A **condition** (`idle`) lets a thread wait inside the lock until another thread signals it: `idle.awaitNanos(remainingNanos)` gives up the lock and sleeps until `idle.signalAll()` (in `release`, when the count reaches zero) or until the time is up, and returns how much time is left. The `while` loop is there because a wait can wake up without a signal. The `finally` sets the state to `STOPPED` and unlocks on every path, including the interruption that `awaitNanos` can throw. `volatile` and `synchronized` are not used anywhere in `src/main`: the lock covers every shared field. (One test stand-in, in `RollingDeployTest`, marks a field `volatile`, which makes every thread see its latest value.)
 
 **Counters and maps shared by threads.** `LongAdder` (in `ServiceMetrics`) is a counter built for many writers: `increment()`, `add(n)`, `sum()`. `ConcurrentHashMap` is a map that many threads may use at once; `requests.computeIfAbsent(route + "|" + status, key -> new LongAdder()).increment()` makes the counter for a route and status on first use and bumps it. The database, not a Java map, now decides who owns a seat: the rule moved out of memory so that three instances can share it.
 
@@ -724,12 +735,16 @@ A **lock** (`ReentrantLock`) lets one thread at a time run the code between `loc
   List<Outcome> run() throws InterruptedException {
     Queue<Outcome> outcomes = new ConcurrentLinkedQueue<>();
     Semaphore slots = new Semaphore(settings.maxInFlight());
-    long intervalNanos = NANOS_PER_SECOND / settings.ratePerSecond();
     long planned = settings.plannedRequests();
     long firstNanos = startNanos - settings.warmup().toNanos();
     try (ExecutorService senders = Executors.newVirtualThreadPerTaskExecutor()) {
       for (long requestIndex = 0; requestIndex < planned; requestIndex++) {
-        long dueNanos = firstNanos + requestIndex * intervalNanos;
+        // From the index, never from a rounded interval: at 3,000 a second the interval is
+        // 333,333.3 ns, and adding a rounded 333,333 ns would start request 15,000 (the first of
+        // the measured part) 5 microseconds before time zero, among the warm-up.
+        long dueNanos =
+            firstNanos
+                + Math.multiplyExact(requestIndex, NANOS_PER_SECOND) / settings.ratePerSecond();
         long waitNanos = dueNanos - System.nanoTime();
         if (waitNanos > 0) {
           LockSupport.parkNanos(waitNanos);
@@ -737,20 +752,28 @@ A **lock** (`ReentrantLock`) lets one thread at a time run the code between `loc
         if (Thread.interrupted()) {
           throw new InterruptedException("the load run was interrupted");
         }
+        long dueAt = dueNanos - startNanos;
+        boolean isHold = isHold(requestIndex);
+        if (dueAt >= 0) {
+          (isHold ? measuredHolds : measuredReads).incrementAndGet();
+        }
         if (!slots.tryAcquire()) {
-          outcomes.add(Outcome.notSent(dueNanos - startNanos));
+          outcomes.add(Outcome.notSent(dueAt));
           continue;
         }
         long index = requestIndex;
-        long dueAt = dueNanos - startNanos;
         senders.submit(() -> {
           try {
-            outcomes.add(send(index, dueAt));
+            outcomes.add(sendSafely(index, dueAt, isHold));
           } finally {
             slots.release();
           }
         });
       }
+    }
+    if (outcomes.size() != planned) {
+      throw new IllegalStateException(
+          "the run planned " + planned + " requests but has " + outcomes.size() + " outcomes");
     }
     return new ArrayList<>(outcomes);
   }
@@ -758,9 +781,12 @@ A **lock** (`ReentrantLock`) lets one thread at a time run the code between `loc
 
 - `Queue<Outcome> outcomes = new ConcurrentLinkedQueue<>();` is a queue many threads may add to at once; each sender thread adds its result.
 - `Semaphore slots = new Semaphore(settings.maxInFlight())` holds 4,000 permits. `slots.tryAcquire()` takes one without waiting and returns `false` if none is left, in which case the request is recorded as "not sent" instead of piling up. `slots.release()` in the `finally` gives the permit back.
+- `dueNanos` is computed from the request's index every time, `firstNanos + Math.multiplyExact(requestIndex, NANOS_PER_SECOND) / settings.ratePerSecond()`, and not by adding a rounded interval again and again. The comment gives the numbers: at 3,000 requests a second the interval is 333,333.3 ns, and adding a rounded 333,333 ns would let the error grow until request 15,000 started 5 microseconds too early. Multiplying first and dividing last keeps the error under one nanosecond. `Math.multiplyExact` throws instead of silently wrapping around if the product were too large for a `long`.
+- `(isHold ? measuredHolds : measuredReads).incrementAndGet()` picks one of two counters with a conditional expression and adds one to it, for requests due at or after time zero.
+- After the loop, the `try` block has closed the executor, which waits for every task. Then the code checks that there is one outcome per planned request and throws an `IllegalStateException` if not: a lost outcome would be a bug in the harness, not a result.
 - `Executors.newVirtualThreadPerTaskExecutor()` makes a new **virtual thread** for each submitted task (Java 21). Thousands may wait for an answer at once at almost no cost, which a pool of 64 platform threads could not do.
 - `LockSupport.parkNanos(waitNanos)` sleeps this thread until the next request is due, so the loop sends at a steady rate (`java-harness-walkthrough-1.md` and `java-harness-walkthrough-2.md`). `Thread.interrupted()` tests and clears the interrupt flag, and the code turns it into an `InterruptedException` so the run can be stopped.
-- `long index = requestIndex;` copies the loop counter into a variable that is never changed: a lambda may use only variables that are not changed after they are set.
+- `long index = requestIndex;` copies the loop counter into a variable that is never changed: a lambda may use only variables that are not changed after they are set. `dueAt` and `isHold` are such variables already. The task calls `sendSafely`, which turns an unexpected error in the harness's own code into an outcome instead of losing it (`java-harness-walkthrough-1.md`).
 
 **Starting and stopping.** The main thread of an instance waits for a signal. `CountDownLatch stopped = new CountDownLatch(1);` is a gate with a count of 1. `stopped.await()` blocks the main thread until the count reaches 0; the shutdown hook (feature 4) calls `stopped.countDown()` when the drain is over. `throws InterruptedException` appears because `await()` can be interrupted. Code that catches it should restore the flag with `Thread.currentThread().interrupt()`, as `SeatWaveServer.drainAndStop` and `DockerCompose.run` do.
 
@@ -768,28 +794,46 @@ A **lock** (`ReentrantLock`) lets one thread at a time run the code between `loc
 
 ```java
   private void run(List<String> action, Duration limit) throws IOException {
-    List<String> command = new ArrayList<>(List.of("docker", "compose", "-p", project));
+    List<String> command = new ArrayList<>(program);
+    command.addAll(List.of("-p", project));
     command.addAll(action);
     Process process = new ProcessBuilder(command).redirectErrorStream(true).start();
+    // Read while the child runs: a child whose output fills the pipe would otherwise wait for a
+    // reader forever, and the wait below would end only at its time limit.
+    FutureTask<String> output =
+        new FutureTask<>(() -> {
+          try (InputStream stream = process.getInputStream()) {
+            return new String(stream.readAllBytes(), StandardCharsets.UTF_8);
+          }
+        });
+    Thread.ofVirtual().name("docker-compose-output").start(output);
     try {
       if (!process.waitFor(limit.toMillis(), TimeUnit.MILLISECONDS)) {
         process.destroyForcibly();
         throw new IOException(String.join(" ", command) + " did not finish within " + limit);
       }
-      String output = new String(process.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
+      // Bounded too: a grandchild that kept the pipe open would otherwise hold the read forever.
+      String text = output.get(limit.toMillis(), TimeUnit.MILLISECONDS);
       if (process.exitValue() != 0) {
         throw new IOException(
-            String.join(" ", command) + " exited " + process.exitValue() + ": " + output.strip());
+            String.join(" ", command) + " exited " + process.exitValue() + ": " + text.strip());
       }
     } catch (InterruptedException interrupted) {
       process.destroyForcibly();
       Thread.currentThread().interrupt();
       throw new IOException(String.join(" ", command) + " was interrupted", interrupted);
+    } catch (TimeoutException stillOpen) {
+      process.destroyForcibly();
+      throw new IOException(
+          "the output of " + String.join(" ", command) + " did not end within " + limit, stillOpen);
+    } catch (ExecutionException unreadable) {
+      throw new IOException(
+          "the output of " + String.join(" ", command) + " cannot be read", unreadable.getCause());
     }
   }
 ```
 
-`new ProcessBuilder(command).redirectErrorStream(true).start()` starts the process and merges its error output into its normal output. `process.waitFor(limit, unit)` waits for it to end and returns `false` if the limit passes, in which case `destroyForcibly()` kills it. The list form (never one string passed to a shell) means a service name cannot turn into a second command. This note and the whole set did not run it, because it needs Docker.
+`command` starts as a copy of `program` (`docker compose` in real use; a test passes another program) and gets `-p <project>` and the action added. `new ProcessBuilder(command).redirectErrorStream(true).start()` starts the process and merges its error output into its normal output. The output is read at the same time by a `FutureTask`, a task whose result can be fetched later with `get()`, on a virtual thread of its own (`Thread.ofVirtual().name(...).start(output)`). The comment gives the reason: a child process writes into a pipe of limited size, and if nobody reads it, a child with a lot of output blocks forever, so the wait would end only at its time limit. `process.waitFor(limit, unit)` waits for the process to end and returns `false` if the limit passes, in which case `destroyForcibly()` kills it. `output.get(limit, unit)` then fetches the text, waiting at most the same limit (a grandchild process that kept the pipe open would otherwise hold the read forever); if the wait runs out it throws a `TimeoutException`, and if reading failed an `ExecutionException`, which the two last `catch` blocks turn into an `IOException` with the real cause. The list form (never one string passed to a shell) means a service name cannot turn into a second command. This note did not run `docker`; `DockerComposeTest` runs the same code with a stand-in program.
 
 #### 18. Javadoc
 

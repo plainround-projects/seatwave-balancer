@@ -15,7 +15,7 @@ Tests are the requirements here, so they should read like requirements. `assertT
 | `gradle/libs.versions.toml` | `assertj = "3.27.7"` and `assertj-core`. |
 | `build.gradle.kts` | `testImplementation(libs.assertj.core)`. |
 | `gradle.lockfile` | Locks `assertj-core` and its dependency `byte-buddy` 1.18.3 (`dependency-locking.md`). |
-| `src/test/java/**` | `assertThat` is imported in 16 files and `assertThatThrownBy` in 6 files. There are 190 `assertThat(` calls and 14 `assertThatThrownBy(` calls in all. |
+| `src/test/java/**` | `assertThat` is imported in 21 files and `assertThatThrownBy` in 9 files. There are 301 `assertThat(` calls and 19 `assertThatThrownBy(` calls in all. |
 
 ## How it works underneath
 
@@ -51,7 +51,7 @@ The counts in this section come from `grep -rho` over `src/test` and count each 
   }
 ```
 
-`isEqualTo` compares with `equals`. It is the most used method here (77 calls). `assertThat(granted.hold().seat()).isEqualTo("A-7")` compares two texts, character by character. `isFalse()` checks a `boolean`. `granted.hold().expiresAt()` is an `Instant` (a point in time), and `START.plusSeconds(300)` is another; `isEqualTo` compares the two points. Java **records** get a correct `equals` automatically, so two records with the same contents are equal. The last test relies on it: `assertThat(second).isEqualTo(Result.error(new HoldRefusal.SeatTaken()))` compares a `Result` that holds a refusal with a freshly made one (`result4j.md`).
+`isEqualTo` compares with `equals`. It is the most used method here (127 calls). `assertThat(granted.hold().seat()).isEqualTo("A-7")` compares two texts, character by character. `isFalse()` checks a `boolean`. `granted.hold().expiresAt()` is an `Instant` (a point in time), and `START.plusSeconds(300)` is another; `isEqualTo` compares the two points. Java **records** get a correct `equals` automatically, so two records with the same contents are equal. The last test relies on it: `assertThat(second).isEqualTo(Result.error(new HoldRefusal.SeatTaken()))` compares a `Result` that holds a refusal with a freshly made one (`result4j.md`).
 
 ### Lists: `containsExactly`, `isEmpty`
 
@@ -125,28 +125,35 @@ The counts in this section come from `grep -rho` over `src/test` and count each 
 
 ```java
   @Test
-  void bothBalancersSeeThreeInstancesUp() throws Exception {
-    for (RuntimeApi api : new RuntimeApi[] {LB1_API, LB2_API}) {
-      assertThat(api.showStat().servers("seatwave")).hasSize(3).allMatch(StatRow::isUp);
+  void bothBalancersSeeThreeInstancesFullyUpInBothCheckedBackends() throws Exception {
+    for (RuntimeApi api : List.of(lb1Api, lb2Api)) {
+      for (String backend : BACKENDS) {
+        assertThat(api.showStat().servers(backend))
+            .as(backend)
+            .hasSize(INSTANCES.size())
+            .allMatch(StatRow::isFullyUp);
+      }
     }
   }
 
   @Test
   void readsAHoldThroughEveryInstanceWhicheverMadeIt() throws Exception {
+    // Round robin gives every instance its share only once slow start is over everywhere.
+    await().atMost(SETTLED_WITHIN).until(() -> isSettled(lb2Api));
     String holdId = freeHold();
 
     Set<String> readers = new HashSet<>();
     for (int round = 0; round < ROUNDS; round++) {
-      HttpResponse<String> read = get(LB2 + "/v1/holds/" + holdId);
+      HttpResponse<String> read = get(lb2 + "/v1/holds/" + holdId);
       assertThat(read.statusCode()).isEqualTo(200);
       readers.add(read.headers().firstValue("X-Served-By").orElseThrow());
     }
 
-    assertThat(readers).containsExactlyInAnyOrder("seatwave-1", "seatwave-2", "seatwave-3");
+    assertThat(readers).containsExactlyInAnyOrderElementsOf(INSTANCES);
   }
 ```
 
-`hasSize(3)` checks the number of items, and `allMatch(StatRow::isUp)` checks that every item satisfies a condition. `containsExactlyInAnyOrder` checks the items without caring about order: the three instances must each have answered, in whatever order the balancer chose. These two tests need the running stack and were not run for these notes.
+`hasSize(INSTANCES.size())` checks the number of items, and `allMatch(StatRow::isFullyUp)` checks that every item satisfies a condition. `.as(backend)` labels the check with the backend's name (more on labels below). `containsExactlyInAnyOrderElementsOf(INSTANCES)` checks the items without caring about order, against the items of another collection: the three instances must each have answered, in whatever order the balancer chose. These two tests need the running stack and were not run for these notes.
 
 ### Text: `contains`, `doesNotContain`, `containsPattern`
 
@@ -163,7 +170,7 @@ The counts in this section come from `grep -rho` over `src/test` and count each 
   }
 
   @Test
-  void retriesOnlyWhatSeatWaveDidNotServe() throws IOException {
+  void retriesOnlyWhatIsSafeToRepeat() throws IOException {
     String production = backend("seatwave");
 
     assertThat(production).contains("\n  retry-on conn-failure empty-response 503\n");
@@ -185,7 +192,7 @@ The counts in this section come from `grep -rho` over `src/test` and count each 
   }
 ```
 
-- `contains(...)` on text checks that a piece occurs somewhere. `containsPattern(...)` is the same with a **regular expression** (a pattern language for text, `java.md`): it passes when the pattern matches some part of the text. `doesNotContain(...)` checks the opposite. These tests read the balancer's configuration as text and check the rules the module states: the readiness check every two seconds and three failures to mark down, retries only for what SeatWave did not serve, no retries on the active-only backend (`tests-stack-walkthrough.md`).
+- `contains(...)` on text checks that a piece occurs somewhere. `containsPattern(...)` is the same with a **regular expression** (a pattern language for text, `java.md`): it passes when the pattern matches some part of the text. `doesNotContain(...)` checks the opposite. These tests read the balancer's configuration as text and check the rules the module states: the readiness check every two seconds and three failures to mark down, retries only for what is safe to repeat, no retries on the active-only backend (`tests-config-walkthrough.md`).
 - Several `contains` and `doesNotContain` calls chain on one text, as in the last test: `.doesNotContain("redispatch").doesNotContain("observe").doesNotContain("slowstart")`.
 - The `\n` in `"http-check send meth GET uri /ready\n"` is a line break. It pins the end of the line, so a longer line that merely begins with the same words does not pass.
 
@@ -232,7 +239,7 @@ The counts in this section come from `grep -rho` over `src/test` and count each 
 }
 ```
 
-`.as("backend %s in haproxy.cfg", name)` gives the check a **label**, with the text filled in like `String.format`. When it fails, the message starts with the label, so a failure in a loop or a helper says which backend or service was missing. `isNotNegative()` is true for zero and above: the helper returns `-1` when the block is not found. I found 2 `.as(` calls, both here.
+`.as("backend %s in haproxy.cfg", name)` gives the check a **label**, with the text filled in like `String.format`. When it fails, the message starts with the label, so a failure in a loop or a helper says which backend or service was missing. `isNotNegative()` is true for zero and above: the helper returns `-1` when the block is not found. I found 7 `.as(` calls: these two, one in `HarnessCliTest`, one in `LoadRunTest` and three in `StackTest`.
 
 ### Exceptions: `assertThatThrownBy`
 
@@ -247,7 +254,7 @@ The counts in this section come from `grep -rho` over `src/test` and count each 
   }
 ```
 
-`assertThatThrownBy(() -> lifecycle.awaitDrained(Duration.ofMillis(-1)))` runs the call, catches what it throws and `isInstanceOf(IllegalArgumentException.class)` checks the type. If nothing is thrown, the check fails: a test that expects a refusal cannot pass by accident. `hasMessageContaining(...)` checks a piece of the message (8 calls in all); `hasMessage(...)` checks all of it. `isInstanceOf` is the third most used check after `isEqualTo` and `contains` (18 calls).
+`assertThatThrownBy(() -> lifecycle.awaitDrained(Duration.ofMillis(-1)))` runs the call, catches what it throws and `isInstanceOf(IllegalArgumentException.class)` checks the type. If nothing is thrown, the check fails: a test that expects a refusal cannot pass by accident. `hasMessageContaining(...)` checks a piece of the message (8 calls in all); `hasMessage(...)` checks all of it. `isInstanceOf` is the third most used check after `isEqualTo` and `contains` (28 calls).
 
 ### Results: comparing and sorting outcomes
 
@@ -300,7 +307,7 @@ grep -rho "assertThat(" src/test | wc -l
 grep -rho "assertThatThrownBy(" src/test | wc -l
 ```
 
-   Expected: `190` and `14`.
+   Expected: `301` and `19`.
 
 2. Count the files that import each:
 
@@ -309,7 +316,7 @@ grep -rl "assertThat;" src/test | wc -l
 grep -rl "assertThatThrownBy;" src/test | wc -l
 ```
 
-   Expected: `16` and `6`.
+   Expected: `21` and `9`.
 
 3. Run one test class that is full of assertions:
 
@@ -317,7 +324,7 @@ grep -rl "assertThatThrownBy;" src/test | wc -l
 ./gradlew --offline cleanTest test --tests '*SettingsReaderTest' --console=plain
 ```
 
-   Expected: three `PASSED` lines and `BUILD SUCCESSFUL`.
+   Expected: six `PASSED` lines and `BUILD SUCCESSFUL`.
 
 4. See an AssertJ failure message. In a **scratch copy**, change `"count must be a whole number, but was seven"` in `SettingsReaderTest.java` to `"count must be a number"`, then run the command of step 3. Expected: `SettingsReaderTest > collectsOneProblemPerMissingOrInvalidKey() FAILED` on the console, and the full message in `build/test-results/test/TEST-io.plainround.seatwave.balancer.config.SettingsReaderTest.xml`. It begins `Expecting actual:` and lists the six actual problems, then `to contain exactly (and in same order):` and the six expected ones, then `but some elements were not found:` followed by `["count must be a number"]` and `and others were not expected:` followed by `["count must be a whole number, but was seven"]`. Put the file back afterwards.
 
@@ -327,7 +334,7 @@ grep -rl "assertThatThrownBy;" src/test | wc -l
 grep -rn "\.as(" src/test | wc -l
 ```
 
-   Expected: `2`.
+   Expected: `7`.
 
 ## Mistakes people make
 

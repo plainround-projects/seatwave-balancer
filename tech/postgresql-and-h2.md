@@ -206,7 +206,7 @@ Only the first run names the tables as PostgreSQL would. Note that the schema al
 ./gradlew --offline cleanTest test 2>&1 | grep -cE "PASSED"
 ```
 
-It prints `98`, the number of tests. The README states the same count.
+It prints `152`, the number of tests of version 1.1.0 (I ran it in a scratch copy on 11 November 2026).
 
 4. Ask the instance for readiness with a database that is not there (the steps are in `java-seatwave-walkthrough-2.md`). `/health` answers `200` and `/ready` answers `503` with `database-unreachable`. The pool starts without the database, which is the property this module needs from it.
 

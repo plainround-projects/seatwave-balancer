@@ -22,7 +22,7 @@ Terms you need.
 - **`config`**: the course rule is that no number lives in code. Every timeout, port and pool size comes from a file, and a missing key is an error, not a silent default. Reporting all problems in one run saves a reader from fixing one error per attempt. The three programs of this project (an instance, the load harness and the deploy tool) all read their settings through these two classes.
 - **`json`**: a request body is input from outside. Module 7's contract says unknown fields, wrong types and numbers out of range are errors. A strict codec makes the contract real, and stops "mass assignment", where a client sets a field it should not be able to set. The same codec also reads SeatWave's replies in the load harness.
 
-Both packages were copied from the Module 9 project, `seatwave-proxy`, as of its first commit. That project fixed several things in its copies afterwards. The differences are listed below, in the walkthrough, at the places where they show.
+Both packages come from the Module 9 project, `seatwave-proxy`. Version 1.0.0 of this project copied them as of that project's first commit, and that project fixed several things in its copies afterwards. Version 1.1.0 takes the fixed copies: `SettingsReader.java` and `JsonCodec.java` are now byte for byte the reviewed Module 9 files, with only the package name changed, and `SettingsFiles.java` differs from its Module 9 copy by one comment. The walkthrough below says, at each place, what changed against version 1.0.0.
 
 ## Where it appears
 
@@ -36,7 +36,7 @@ Used by: `seatwave/ServiceSettings.java` (reads with `SettingsReader`), `seatwav
 
 ## How it works underneath
 
-**Settings.** The file is read into a `java.util.Properties` object: a table from key text to value text. `SettingsReader` wraps it and offers typed reads (`intBetween`, `millisBetween`, `textMatching`, `listMatching`, `text`). When a key is missing or wrong, the method writes one sentence into an internal list of problems and returns a harmless stand-in value, so the next read can run. After all reads, the caller looks at the list: empty means every value is trustworthy. `SettingsFiles.load` wraps the whole sequence for a command-line program: read the file, run the function, and either return the settings or print every problem.
+**Settings.** The file is read into a `java.util.Properties` object: a table from key text to value text. `SettingsReader` wraps it and offers typed reads (`intBetween`, `millisBetween`, `textMatching`, `filePath`, `listMatching`, `text`). When a key is missing or wrong, the method writes one sentence into an internal list of problems and returns a harmless stand-in value, so the next read can run. After all reads, the caller looks at the list: empty means every value is trustworthy. `SettingsFiles.load` wraps the whole sequence for a command-line program: read the file, run the function, and either return the settings or print every problem.
 
 **JSON.** Jackson normally reads leniently. It ignores unknown fields, turns the text `"1"` into the number 1, cuts `1.5` to 1 for an integer, and lets a repeated field overwrite the first. `JsonCodec` switches each of those off, one by one. It also reads the first token by hand, so an empty body, a body that is not an object and data after the object each get their own message.
 
@@ -86,6 +86,11 @@ The Javadoc states the contract.
 `public final class` means: visible everywhere, and no one can extend it.
 
 ```java
+  // A path as a file system can hold it: any character but a control character (a line break or a
+  // NUL cannot be part of a real file name), up to 4,096 characters, Linux's PATH_MAX. Spaces, "+"
+  // and deep folders are allowed, because a reader's checkout may sit in any of them.
+  private static final Pattern FILE_PATH = Pattern.compile("[^\\p{Cntrl}]{1,4096}");
+
   private final Properties properties;
   private final List<String> problems = new ArrayList<>();
 
@@ -99,6 +104,8 @@ The Javadoc states the contract.
   }
 ```
 
+`FILE_PATH` is the rule for a file path, written once for every program of the project. `[^\\p{Cntrl}]{1,4096}` means one to 4,096 characters, none of them a control character. `\p{Cntrl}` is the class of control characters (a tab, a line break, the NUL byte), and `[^...]` means "any character except these". In Java source a backslash inside a string must be doubled, so the source shows `\\p`. The comment gives both reasons. A line break or a NUL cannot be part of a real file name, and a line break in a value could also end one line of a log and start another. 4,096 is `PATH_MAX`, the longest path Linux accepts. Spaces, `+` signs and deep folders are allowed, because a reader's copy of the project may sit in any of them. Version 1.0.0 had this pattern twice, in `ServiceSettings` and in `DeploySettings`, as two private constants named `FILE`.
+
 The reader keeps the `Properties` and an `ArrayList` of problem sentences. The constructor refuses `null`.
 
 `Objects.requireNonNull(properties, "properties")` returns its first argument if it is not null and otherwise throws a `NullPointerException` whose message is the second argument, so a mistake names the argument.
@@ -109,7 +116,8 @@ The reader keeps the `Properties` and an `ArrayList` of problem sentences. The c
    *
    * @param path the file
    * @return the loaded properties
-   * @throws IOException if the file does not exist or cannot be read; the message says which
+   * @throws IOException if the file does not exist, cannot be read or is not a properties file; the
+   *     message says which
    */
   public static Properties load(Path path) throws IOException {
     Objects.requireNonNull(path, "path");
@@ -118,6 +126,16 @@ The reader keeps the `Properties` and an `ArrayList` of problem sentences. The c
       properties.load(reader);
     } catch (NoSuchFileException missing) {
       throw new IOException("the settings file " + path + " does not exist", missing);
+    } catch (IllegalArgumentException malformed) {
+      // Properties.load refuses a broken escape (a backslash and a u with fewer than four hex
+      // digits) with this unchecked exception; a typo in a settings file is an expected failure,
+      // so it is reported like an unreadable file.
+      throw new IOException(
+          "the settings file "
+              + path
+              + " is not a valid properties file: "
+              + malformed.getMessage(),
+          malformed);
     }
     return properties;
   }
@@ -129,8 +147,9 @@ The reader keeps the `Properties` and an `ArrayList` of problem sentences. The c
 - `try (Reader reader = ...)` is **try-with-resources**: Java closes the reader when the block ends, whether it ends normally or with an error.
 - `properties.load(reader)` parses the `key=value` lines. Lines that start with `#` are comments.
 - `NoSuchFileException` (a kind of `IOException`) is caught and replaced with a new `IOException` whose message is `the settings file <path> does not exist`. The original is passed as the **cause**, so a stack trace still shows what really happened.
+- `IllegalArgumentException` is the unchecked error `Properties.load` throws when a file holds a broken escape: a backslash and a `u` followed by fewer than four hexadecimal digits (in a properties file `\u0041` means `A`). The comment says why it is caught: a typo in a settings file is an expected failure, so it is reported like an unreadable file. It becomes an `IOException` with the message `the settings file <path> is not a valid properties file: ` followed by the library's own words, `Malformed \uxxxx encoding.`, and the original as its cause. The `throw new IOException(...)` statement is spread over six lines only so each piece of the message stands on its own line. The Javadoc's `@throws` line now names all three cases, and its second line is only the rest of that sentence. `SettingsReaderTest.reportsABrokenEscapeAsAnUnreadableSettingsFile` checks the whole message.
 
-One difference from the Module 9 copy. The later `seatwave-proxy` version also catches `IllegalArgumentException` here. `Properties.load` throws that unchecked error when a file holds a broken escape (`\u` followed by fewer than four hexadecimal digits; in a properties file `\u0041` means `A`). Here `load` lets it fly out, and the catch lives one level up, in `SettingsFiles`. A caller that uses `SettingsReader.load` directly, such as the test of the shipped settings, would get the raw error. All three programs go through `SettingsFiles`, so users see the friendly message (below).
+In version 1.0.0 `load` let the `IllegalArgumentException` fly out, and the catch lived one level up, in `SettingsFiles`. A caller that used `SettingsReader.load` directly got the raw error. With the catch here, every caller gets the same `IOException`.
 
 ```java
   /**
@@ -217,6 +236,20 @@ Because the minimum is returned in every failure, the caller's next line still w
 - No match: record `key must match <pattern>, but was <text>` and return an empty string.
 
 Notice that the message shows the pattern's source text, so a user sees the rule that broke. A rule such as `[a-z][a-z0-9-]{0,31}` is readable enough.
+
+```java
+  /**
+   * Reads a file path.
+   *
+   * @param key the key
+   * @return the trimmed path, or an empty string if the key is missing or holds a control character
+   */
+  public String filePath(String key) {
+    return textMatching(key, FILE_PATH);
+  }
+```
+
+`filePath` reads a file path. It is `textMatching` with one fixed pattern, `FILE_PATH`, so every program of the project checks a path by the same rule instead of each writing its own. A missing key or a path with a control character gives a problem line and the empty string, as `textMatching` does. `SettingsReaderTest.acceptsAFilePathInADeepFolderWithSpacesAndPlusSigns` and `SettingsReaderTest.refusesAFilePathWithAControlCharacter` test both sides.
 
 ```java
   /**
@@ -372,23 +405,20 @@ The `switch` is exhaustive: `Result` has exactly two cases, so no `default` is n
 
 ```java
     } catch (IOException unreadable) {
+      // SettingsReader.load also turns a broken escape into this, so only the file's own
+      // problems land here; an exception from the reading function is a bug and is not caught.
       err.println(unreadable.getMessage());
-      return Optional.empty();
-    } catch (IllegalArgumentException malformed) {
-      // Properties.load refuses a malformed \\u escape this way; it is a mistake in the file.
-      err.println("the settings file " + file + " cannot be read: " + malformed.getMessage());
       return Optional.empty();
     }
   }
 }
 ```
 
-Two failure paths around the whole thing.
+One failure path around the whole thing.
 
-- `IOException`: the message was written for a human by `SettingsReader.load` (`the settings file ... does not exist`). It is printed as it is.
-- `IllegalArgumentException`: `Properties.load` refuses a broken escape this way, and it is a mistake in the file. The message printed is `the settings file <file> cannot be read: Malformed \uxxxx encoding.` `SettingsFilesTest.reportsAMalformedEscapeAsAProblemNotACrash` tests it, and I ran the program on such a file: it exited with status 2.
+- `IOException`: the message was written for a human by `SettingsReader.load`: `the settings file ... does not exist`, or `the settings file ... is not a valid properties file: Malformed \uxxxx encoding.` for a broken escape. It is printed as it is, and the method returns an empty `Optional`, so the program exits with status 2. `SettingsFilesTest.reportsAMalformedEscapeAsAProblemNotACrash` tests the broken escape.
 
-A careful reader should know the catch is wide: it also catches an `IllegalArgumentException` thrown by `reading.apply`. If a settings class had a bug that threw one, the user would be told the file "cannot be read". `ServiceSettings.from` avoids this by recording problems rather than throwing.
+The comment says what is deliberately not caught. In version 1.0.0 a second `catch (IllegalArgumentException malformed)` stood here, for the broken escape. That catch was wide: it also caught an `IllegalArgumentException` thrown by `reading.apply`, so a bug in a settings class would have been reported to the user as a file that "cannot be read". Now `SettingsReader.load` turns the broken escape into an `IOException` itself, so only the file's own problems land in this `catch`. An exception from the reading function is a bug in the program, and it travels on to the caller with its stack trace. `SettingsFilesTest.letsABugInTheReadingFunctionThrough` passes a function that throws `IllegalArgumentException("a bug in the settings record")` and checks that the same exception comes out and nothing is printed.
 
 ### `json/JsonCodec.java`
 
@@ -401,6 +431,7 @@ import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.core.JsonToken;
 import com.fasterxml.jackson.core.StreamReadFeature;
 import com.fasterxml.jackson.core.exc.InputCoercionException;
+import com.fasterxml.jackson.core.exc.StreamReadException;
 import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.JsonMappingException;
 import com.fasterxml.jackson.databind.MapperFeature;
@@ -418,7 +449,7 @@ import java.util.Objects;
 import java.util.stream.Collectors;
 ```
 
-The imports are mostly Jackson (see `jackson.md`). The names to know: `ObjectMapper` is the object that converts. `JsonMapper.builder()` makes one with chosen settings. `JsonParser` and `JsonToken` read JSON piece by piece. `DeserializationFeature`, `MapperFeature`, `StreamReadFeature` and the `Coercion` classes are switches. The exception classes name the kinds of failure. `Collectors` gathers the pieces of a stream into one result.
+The imports are mostly Jackson (see `jackson.md`). The names to know: `ObjectMapper` is the object that converts. `JsonMapper.builder()` makes one with chosen settings. `JsonParser` and `JsonToken` read JSON piece by piece. `DeserializationFeature`, `MapperFeature`, `StreamReadFeature` and the `Coercion` classes are switches. The exception classes name the kinds of failure; `StreamReadException` is the one for an error found while reading the text itself, below the level of records. `Collectors` gathers the pieces of a stream into one result.
 
 ```java
 /**
@@ -434,14 +465,18 @@ public final class JsonCodec {
 
 The Javadoc lists what is refused: "Unknown fields, nulls for numbers, a value of the wrong type, a number out of range, trailing data and duplicate fields". The promise at the end, "a reason that names the field", is the contract. The class is thread-safe, because the mapper "is configured once in the constructor and only read afterwards".
 
-Two of the promises are not fully kept in this copy. Trailing text that is not JSON, and a repeated field, both give the whole-body message "the body is not valid JSON", not a message that names the field. The walkthrough of `read` shows where.
-
 ```java
   // RFC 6901: the empty pointer is the whole document.
   private static final String WHOLE_BODY = "";
+  // Jackson has no exception type of its own for a repeated field; STRICT_DUPLICATE_DETECTION
+  // reports it as a parse error with this message, so the message is the only signal. A test pins
+  // it, so a Jackson version that words it differently fails the build instead of the reason.
+  private static final String DUPLICATE_MESSAGE = "Duplicate field '";
 ```
 
 `WHOLE_BODY` is the empty string, the JSON pointer of the whole document (RFC 6901).
+
+`DUPLICATE_MESSAGE` is the start of the text Jackson writes when it finds a field name twice: `Duplicate field 'count'`, for example. The comment explains why the code looks at a message at all, which is usually fragile. Jackson has no exception class of its own for a repeated field: `STRICT_DUPLICATE_DETECTION` (below) reports it as a general parse error, so its message is the only way to tell it apart from broken JSON. The fragility is covered by a test: `JsonCodecTest.namesAFieldThatAppearsTwice` expects `/count appears more than once`, so a Jackson version that words the message differently fails the build instead of quietly giving clients a worse reason.
 
 ```java
   private final ObjectMapper mapper =
@@ -503,11 +538,9 @@ The mapper is made once and switched to strict.
         return Result.error(new BindingProblem(WHOLE_BODY, "the body must be a JSON object"));
       }
       T value = mapper.readValue(parser, type);
-      if (parser.nextToken() != null) {
-        return Result.error(
-            new BindingProblem(WHOLE_BODY, "the body has data after the JSON object"));
-      }
-      return Result.success(value);
+      return hasMore(parser)
+          ? Result.error(new BindingProblem(WHOLE_BODY, "the body has data after the JSON object"))
+          : Result.success(value);
 ```
 
 The body of `read`. The comment says the parser is driven by hand so that each kind of bad body "gets its own message instead of one generic type error".
@@ -516,8 +549,7 @@ The body of `read`. The comment says the parser is driven by hand so that each k
 2. `parser.nextToken()` returns the first piece. `null` means there was nothing: "the body is empty; send a JSON object".
 3. A first token other than `START_OBJECT` (the `{`) means the body is a list, a number or a text: "the body must be a JSON object".
 4. `mapper.readValue(parser, type)` reads one object into the record.
-5. `parser.nextToken() != null` after the object means more text follows: "the body has data after the JSON object".
-6. Otherwise `Result.success(value)`.
+5. `hasMore(parser)` (below) asks whether more text follows the object. If it does, the answer is "the body has data after the JSON object"; otherwise `Result.success(value)`. `? :` is a conditional expression: the value before `:` when the test is true, the value after it when false. The error line is long only because the whole `BindingProblem` sits on it.
 
 ```java
     } catch (UnrecognizedPropertyException unknownField) {
@@ -531,6 +563,14 @@ The body of `read`. The comment says the parser is driven by hand so that each k
       if (unbound.getCause() instanceof InputCoercionException) {
         return Result.error(
             new BindingProblem(pointerOf(unbound), "is out of range for this field"));
+      }
+      return Result.error(new BindingProblem(WHOLE_BODY, "the body is not valid JSON"));
+    } catch (StreamReadException malformed) {
+      if (malformed.getOriginalMessage().startsWith(DUPLICATE_MESSAGE)
+          && malformed.getProcessor() != null) {
+        // The parser stopped on the repeated name, so its context is the path of that field.
+        String pointer = malformed.getProcessor().getParsingContext().pathAsPointer().toString();
+        return Result.error(new BindingProblem(pointer, "appears more than once"));
       }
       return Result.error(new BindingProblem(WHOLE_BODY, "the body is not valid JSON"));
     } catch (JacksonException malformed) {
@@ -547,10 +587,11 @@ The `catch` blocks, from the most specific to the most general. Java uses the fi
 - `UnrecognizedPropertyException`: pointer `/` plus the field name, detail "is not a field of this request".
 - `MismatchedInputException`: a value of the wrong type (a text for a number, a null for a `long`, a float for an integer, a number for a text). Pointer from `pointerOf`, detail "has the wrong type".
 - `JsonMappingException`: other binding failures. The comment: `99999999999999999999` is valid JSON that does not fit the field's type. If the cause is an `InputCoercionException`, the detail is "is out of range for this field". Otherwise: "the body is not valid JSON".
+- `StreamReadException`: an error found while reading the text. If its message starts with `DUPLICATE_MESSAGE` and it knows the parser that stopped (`getProcessor() != null`), it is a repeated field. `getOriginalMessage()` is Jackson's message without the location it adds to `getMessage()`. The comment explains the pointer: the parser stopped on the repeated name, so its parsing context is the path to that field, and `pathAsPointer()` writes that path as an RFC 6901 pointer such as `/count`. The answer is that pointer with "appears more than once". Any other read error is "the body is not valid JSON".
 - `JacksonException`: the general parse failure: "the body is not valid JSON".
 - `IOException`: reading from a string has no real input or output to fail, so this cannot happen. The comment says so; the code turns it into an unchecked error to keep the signature clean.
 
-Two flaws follow from these blocks. A repeated field (`{"eventId":1,"eventId":2}`) is found by `STRICT_DUPLICATE_DETECTION`, which throws a parse error, and the parse error lands in the `JacksonException` block. The answer is "the body is not valid JSON", although the Javadoc promises a message that names the field. And `{"eventId":1} x` makes `parser.nextToken()` on line 81 throw instead of returning a token, so it also lands in that block, not in "the body has data after the JSON object". I ran both through the codec; the Try-it below shows the first. The later `seatwave-proxy` code fixed both: it reports `appears more than once` with the field's pointer, and treats any text after the object as trailing data.
+The order matters in one more place: `JsonMappingException` and `StreamReadException` are both kinds of `JacksonException`, so both must come before the general `JacksonException` block, or they would never be reached. In version 1.0.0 there was no `StreamReadException` block and no `hasMore`. A repeated field then landed in the `JacksonException` block, and so did `{...} x`, whose second `nextToken()` threw: both were answered "the body is not valid JSON", although the Javadoc promises a reason that names the field. Version 1.1.0 keeps that promise.
 
 ```java
   /**
@@ -570,6 +611,20 @@ Two flaws follow from these blocks. A repeated field (`{"eventId":1,"eventId":2}
 ```
 
 `write` turns a record, list or map into JSON text with `mapper.writeValueAsString`. A failure is a programming mistake (a type Jackson cannot write), so it is wrapped in an unchecked `IllegalArgumentException`. Record fields come out in the order they are declared.
+
+```java
+  private static boolean hasMore(JsonParser parser) throws IOException {
+    try {
+      return parser.nextToken() != null;
+    } catch (JacksonException notJson) {
+      // Text after the object that is not JSON at all ("{...} x") is still data after the object,
+      // and that is the reason the client needs, not "not valid JSON".
+      return true;
+    }
+  }
+```
+
+`hasMore` asks whether anything follows the object. `parser.nextToken()` returns the next piece of JSON, or `null` at the end of the text, so `!= null` means "more follows". The catch is the point of the method. When the text after the object is not JSON at all, as in `{...} x`, `nextToken()` does not return a token: it throws a `JacksonException`, because `x` is not a valid start of anything. The comment says why that still counts as more data: the reason the client needs is "data after the object", not "not valid JSON". So `hasMore` answers `true` in both cases. `throws IOException` is on the signature because `nextToken` declares it. `JsonCodecTest.refusesDataAfterTheObjectWhetherOrNotItIsJson` sends `{...} {}` and `{...} x` and expects the same answer for both.
 
 ```java
   private static String pointerOf(JsonMappingException failure) {
@@ -619,13 +674,13 @@ One edge: if the path were empty, `pointerOf` would return `/` and not the empty
 
 All commands run in the project folder. Timings differ on every run.
 
-1. Run the tests of the `config` package. Three classes test the readers; `InfrastructureRulesTest` is explained in `tests-config-walkthrough.md`.
+1. Run the tests of the two packages. `SettingsReaderTest` and `SettingsFilesTest` test the readers and `JsonCodecTest` the codec; `InfrastructureRulesTest`, the other test class of the `config` package, is explained in `tests-config-walkthrough.md`.
 
 ```bash
-./gradlew --offline cleanTest test --tests '*SettingsReaderTest' --tests '*SettingsFilesTest' 2>&1 | grep -E "PASSED|FAILED|BUILD"
+./gradlew --offline cleanTest test --tests '*SettingsReaderTest' --tests '*SettingsFilesTest' --tests '*JsonCodecTest' 2>&1 | grep -E "PASSED|FAILED|BUILD"
 ```
 
-Six tests pass, then `BUILD SUCCESSFUL`.
+Seventeen tests pass (six of `SettingsReaderTest`, four of `SettingsFilesTest`, seven of `JsonCodecTest`), then `BUILD SUCCESSFUL`.
 
 2. Ask the settings reader a few questions in JShell, Java's interactive console. First build the libraries folder with `./gradlew --offline -q stackFiles`. The `grep` keeps only the answers.
 
@@ -633,12 +688,13 @@ Six tests pass, then `BUILD SUCCESSFUL`.
 cat > build/settings-try.jsh <<'EOF'
 import io.plainround.seatwave.balancer.config.SettingsReader;
 var properties = new java.util.Properties();
-properties.putAll(java.util.Map.of("count", "seven", "range", "99", "size", " 8 "));
+properties.putAll(java.util.Map.of("count", "seven", "range", "99", "size", " 8 ", "path", "my folder/a+b/db.password"));
 var reader = new SettingsReader(properties);
 reader.intBetween("count", 1, 10)
 reader.intBetween("range", 1, 10)
 reader.intBetween("size", 1, 10)
 reader.text("absent")
+reader.filePath("path")
 reader.problems()
 /exit
 EOF
@@ -650,10 +706,11 @@ $5 ==> 1
 $6 ==> 1
 $7 ==> 8
 $8 ==> ""
-$9 ==> [count must be a whole number, but was seven, range must be from 1 to 10, but was 99, absent is missing]
+$9 ==> "my folder/a+b/db.password"
+$10 ==> [count must be a whole number, but was seven, range must be from 1 to 10, but was 99, absent is missing]
 ```
 
-Bad values give the minimum (1) and a problem sentence. The value `" 8 "` is trimmed and read as 8. A missing key gives an empty string. The numbers `$5` to `$9` are JShell's own labels.
+Bad values give the minimum (1) and a problem sentence. The value `" 8 "` is trimmed and read as 8. A missing key gives an empty string. A path with a space and a `+` passes `filePath` and adds no problem. The numbers `$5` to `$10` are JShell's own labels.
 
 3. Feed the JSON codec good and bad bodies. The record `Hold` here belongs to the experiment, not to the project.
 
@@ -669,7 +726,9 @@ codec.read("{\"eventId\":99999999999999999999,\"seat\":\"A-7\"}", Hold.class)
 codec.read("", Hold.class)
 codec.read("[1]", Hold.class)
 codec.read("{\"eventId\":1,\"seat\":\"A-7\"} {}", Hold.class)
+codec.read("{\"eventId\":1,\"seat\":\"A-7\"} x", Hold.class)
 codec.read("{\"eventId\":1,\"eventId\":2,\"seat\":\"A-7\"}", Hold.class)
+codec.read("{\"eventId\":1,", Hold.class)
 codec.write(new Hold(1, "A-7"))
 /exit
 EOF
@@ -684,21 +743,23 @@ $7 ==> Error[error=BindingProblem[pointer=/eventId, detail=is out of range for t
 $8 ==> Error[error=BindingProblem[pointer=, detail=the body is empty; send a JSON object]]
 $9 ==> Error[error=BindingProblem[pointer=, detail=the body must be a JSON object]]
 $10 ==> Error[error=BindingProblem[pointer=, detail=the body has data after the JSON object]]
-$11 ==> Error[error=BindingProblem[pointer=, detail=the body is not valid JSON]]
-$12 ==> "{\"eventId\":1,\"seat\":\"A-7\"}"
+$11 ==> Error[error=BindingProblem[pointer=, detail=the body has data after the JSON object]]
+$12 ==> Error[error=BindingProblem[pointer=/eventId, detail=appears more than once]]
+$13 ==> Error[error=BindingProblem[pointer=, detail=the body is not valid JSON]]
+$14 ==> "{\"eventId\":1,\"seat\":\"A-7\"}"
 ```
 
-Line `$11` is the repeated `eventId`. It should name `/eventId`; it does not (see the flaw above).
+Lines `$10` and `$11` are the two kinds of data after the object, JSON (`{}`) and not JSON (`x`): both get the same reason, through `hasMore`. Line `$12` is the repeated `eventId`, named by its pointer. Line `$13` is text that stops in the middle, the one case left for "the body is not valid JSON".
 
-4. Give the program a settings file with a broken escape. It prints one friendly line and exits with status 2.
+4. Give the program a settings file with a broken escape. It prints one friendly line and exits with status 2. The doubled backslash in `printf` writes one backslash into the file; with a single one, `printf` itself would turn `\u12` into a control character.
 
 ```bash
-printf 'http.bindAddress=\u12\n' > build/esc.properties
+printf 'http.bindAddress=\\u12\n' > build/esc.properties
 java -cp 'build/stack/lib/*' io.plainround.seatwave.balancer.seatwave.SeatWaveCli build/esc.properties seatwave-1; echo "exit $?"
 ```
 
 ```text
-the settings file build/esc.properties cannot be read: Malformed \uxxxx encoding.
+the settings file build/esc.properties is not a valid properties file: Malformed \uxxxx encoding.
 exit 2
 ```
 
@@ -710,8 +771,8 @@ exit 2
 - **Trusting JSON to match the contract by default.** Jackson is lenient unless told otherwise. Each strict switch in `JsonCodec` closes one real hole: the typo field, the silent conversion, the null that becomes zero, the second value of a repeated field.
 - **Returning a stand-in and using it.** The stand-ins (the minimum, the empty string) are only there to keep reading. `ServiceSettings.from` checks `problems()` before it builds anything.
 - **Escaping a JSON pointer in the wrong order.** Replace `~` first, then `/`.
-- **Catching a general error and mislabeling it.** `SettingsFiles` catches `IllegalArgumentException` around a call that includes the caller's own code; a bug in that code would be reported as an unreadable file.
-- **Copying code and trusting that it is current.** This copy lacks fixes that the Module 9 project made afterwards (the duplicate-field message and the trailing-data message). The project's own README says the code is "unchanged except the package", and no test file for `JsonCodec` exists, so nothing noticed. JaCoCo shows 22 of the 50 lines of `JsonCodec` never run in the build.
+- **Catching a general error and mislabeling it.** Version 1.0.0 of `SettingsFiles` caught `IllegalArgumentException` around a call that includes the caller's own code, so a bug in that code would have been reported as an unreadable file. Now the broken escape is turned into an `IOException` where it happens, in `SettingsReader.load`, and `SettingsFiles` catches only that.
+- **Copying code and trusting that it is current.** Version 1.0.0 copied these packages from the Module 9 project's first commit and missed that project's later fixes (the duplicate-field message and the trailing-data message), and it had no test file for `JsonCodec`, so nothing noticed. Version 1.1.0 takes the reviewed copies and adds `JsonCodecTest`, which pins every message, so a copy that falls behind again fails the build.
 
 ## Check yourself
 

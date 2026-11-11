@@ -1,14 +1,15 @@
 # The `seatwave` tests, part 2: the store, the server and the routes (line by line)
 
-This is part 2 of 2. Part 1 (`tests-seatwave-walkthrough-1.md`) reads the helpers (`TestSettings`, `MutableClock`, `TestDatabase`, `ScriptedHoldStore`) and the tests `LifecycleTest`, `ServiceSettingsTest` and `SeatWaveCliTest`. This part reads `JdbcHoldStoreTest`, `SeatWaveServerTest` and `HoldRoutesTest`. Read part 1 first for the terms (test, assertion, fake, latch, race).
+This is part 2 of 2. Part 1 (`tests-seatwave-walkthrough-1.md`) reads the helpers (`TestSettings`, `MutableClock`, `TestDatabase`, `ScriptedHoldStore`) and the tests `LifecycleTest`, `ServiceSettingsTest` and `SeatWaveCliTest`. This part reads the helper `JdbcStandIns` and the tests `JdbcHoldStoreTest`, `SeatWaveServerTest` and `HoldRoutesTest`. Read part 1 first for the terms (test, assertion, fake, latch, race).
 
 ## What it is
 
-Three test classes, 35 tests in all.
+Three test classes, 41 tests in all, and one helper class.
 
-- `JdbcHoldStoreTest` (13 tests): runs the real SQL of `JdbcHoldStore` on H2. It checks the rules (one seat, one owner; expiry; replay; reused key) and races sixteen threads.
-- `SeatWaveServerTest` (6 tests): starts a real HTTP server on a free port and talks to it with Java's own HTTP client. It checks the gate, the two questions (`/health`, `/ready`), the metrics and the drain.
-- `HoldRoutesTest` (16 tests): calls the routes directly with a `Request` and reads the `Reply`. It checks every status and header without a network.
+- `JdbcStandIns` (no tests): two stand-in data sources the store tests need, built with Java's **dynamic proxies**: one that never connects, and one that makes two racers meet at the `INSERT` of a hold.
+- `JdbcHoldStoreTest` (15 tests): runs the real SQL of `JdbcHoldStore` on H2. It checks the rules (one seat, one owner; expiry; replay; reused key), races sixteen threads, and forces the duplicate-key race of two requests with one key.
+- `SeatWaveServerTest` (7 tests): starts a real HTTP server on a free port and talks to it with Java's own HTTP client. It checks the gate, the two questions (`/health`, `/ready`), `HEAD`, the metrics and the drain.
+- `HoldRoutesTest` (19 tests): calls the routes directly with a `Request` and reads the `Reply`. It checks every status and header without a network.
 
 New terms.
 
@@ -16,11 +17,13 @@ New terms.
 - **Asynchronous** means "start it now, collect the result later". Java's `CompletableFuture` is a promise of a result that is not ready yet. `client.sendAsync(...)` sends a request and returns one.
 - A **timeout** on a request makes the client give up after a time.
 - A **fixed thread pool** runs a set number of threads. The tests use one to start sixteen racers at the same instant.
+- A **data source** (`javax.sql.DataSource`) is the object a program asks for database connections. A **connection** (`java.sql.Connection`) is one open session with the database.
+- A **barrier** (`CyclicBarrier`) is a meeting point: each thread that reaches it waits until a set number of threads are there, then all go on together.
 
 ## Why this repository uses it
 
-- The store is where the module's promise is kept: "one seat, one owner" even when instances race. The only way to trust a race rule is to run a race, so `JdbcHoldStoreTest` does, with sixteen threads on a real database engine.
-- The server tests prove the drain as a client sees it: a request in flight finishes with `201`, a new request gets `503` with `Connection: close`, and the drain ends cleanly.
+- The store is where the module's promise is kept: "one seat, one owner" even when instances race. The only way to trust a race rule is to run a race, so `JdbcHoldStoreTest` does, with sixteen threads on a real database engine, and with a barrier that makes the rarest race happen every time.
+- The server tests prove the drain as a client sees it: a request in flight finishes with `201`, a new request gets `503` with `Connection: close`, and the drain ends cleanly and promptly.
 - The route tests keep every error status and header honest. They are fast because they need no network.
 - Each rule that the balancer relies on is pinned by name here: "nothing was done" in the `503`, `Retry-After`, `Allow`, `private` for cached holds.
 
@@ -28,19 +31,172 @@ New terms.
 
 | File | Tests | What it checks |
 |---|---|---|
-| `seatwave/JdbcHoldStoreTest.java` | 13 | The SQL rules and the races, on H2. |
-| `seatwave/SeatWaveServerTest.java` | 6 | The HTTP server, readiness, metrics and the drain. |
-| `seatwave/HoldRoutesTest.java` | 16 | Every route and every error answer. |
+| `seatwave/JdbcStandIns.java` | 0 | Provides an unreachable data source and one that holds racers at the `INSERT`. |
+| `seatwave/JdbcHoldStoreTest.java` | 15 | The SQL rules and the races, on H2. |
+| `seatwave/SeatWaveServerTest.java` | 7 | The HTTP server, readiness, `HEAD`, metrics and the drain. |
+| `seatwave/HoldRoutesTest.java` | 19 | Every route and every error answer. |
 
 ## How it works underneath
 
-**Store tests.** `@BeforeEach` makes a fresh database and a store. Each test calls `store.hold(command)` and checks the `Result`. The clock is a `MutableClock`, so "300 seconds later" is one method call. The race helper starts sixteen threads that all wait at a latch, opens the latch, and collects the sixteen `Result`s.
+**Store tests.** `@BeforeEach` makes a fresh database and a store. Each test calls `store.hold(command)` and checks the `Result`. The clock is a `MutableClock`, so "300 seconds later" is one method call. The race helper starts a set of threads that all wait at a latch, opens the latch, and collects their `Result`s.
+
+**Proxies.** A **dynamic proxy** is an object Java builds while the program runs. It claims to implement an interface (here `DataSource` or `Connection`), and every call on it goes to one function, the **invocation handler**, which receives the method and its arguments and decides what to do. `JdbcStandIns` uses a handler that passes most calls on to the real H2 object and adds one thing: a wait at the barrier before the `INSERT`, or a count of rollbacks. So the real SQL runs, and the test still controls the timing.
 
 **Server tests.** Each test starts a `SeatWaveServer` on loopback with port 0, over a `ScriptedHoldStore`. The test finds the real ports with `server.port()` and `server.adminPort()`, sends HTTP requests with `java.net.http.HttpClient`, and checks status, headers and body.
 
 **Route tests.** `HoldRoutes` is a plain class: `route(Request)` returns a `Routed` with a `Reply`. The test builds a `Request` by hand and reads the reply. No server, no sockets.
 
 ## Walkthrough of this repository's use
+
+### `seatwave/JdbcStandIns.java`
+
+New in 1.1.0.
+
+```java
+package io.plainround.seatwave.balancer.seatwave;
+
+import java.lang.reflect.InvocationHandler;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
+import java.lang.reflect.Proxy;
+import java.sql.Connection;
+import java.sql.SQLException;
+import java.util.concurrent.BrokenBarrierException;
+import java.util.concurrent.CyclicBarrier;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicInteger;
+import javax.sql.DataSource;
+
+/**
+ * Data sources for the tests of {@link JdbcHoldStore} that a real database cannot give on demand:
+ * one that never connects, and one that holds every racer at the INSERT of a hold until all have
+ * reached it, so a race between two requests with one key happens every time, not by chance.
+ */
+final class JdbcStandIns {
+
+  private static final long BARRIER_SECONDS = 10;
+
+  private JdbcStandIns() {}
+```
+
+The imports come from `java.lang.reflect`, Java's tools for working with methods as objects: `Proxy` builds the stand-ins, `InvocationHandler` is the function that receives every call, `Method` is one method, `InvocationTargetException` wraps an exception thrown by a method called this way. The class comment says what the two stand-ins are for: "a real database cannot give on demand" a database that is down, or two racers that reach the `INSERT` together "every time, not by chance".
+
+`BARRIER_SECONDS` is 10, the longest a racer waits at the barrier. The constructor is `private` and empty: nobody makes an object of this class; it only offers `static` methods.
+
+```java
+  /**
+   * A data source whose every connection attempt fails, as a database that is down does.
+   *
+   * @return the data source
+   */
+  static DataSource unreachable() {
+    return (DataSource)
+        Proxy.newProxyInstance(
+            JdbcStandIns.class.getClassLoader(),
+            new Class<?>[] {DataSource.class},
+            (proxy, method, arguments) -> {
+              if (method.getName().equals("getConnection")) {
+                throw new SQLException("the test database is down", "08001");
+              }
+              throw new UnsupportedOperationException(method.getName());
+            });
+  }
+```
+
+`unreachable()` returns a `DataSource` that is a proxy. `Proxy.newProxyInstance` takes three things: a **class loader** (the part of Java that finds classes; the one that loaded this class is fine), the list of interfaces the proxy claims (only `DataSource`), and the handler, written as a lambda `(proxy, method, arguments) -> ...`.
+
+- A call of `getConnection` throws `SQLException("the test database is down", "08001")`. The second argument is the **SQLState**, a five-character code of the SQL standard; class `08` means "connection exception", and `08001` is "the client could not establish the connection".
+- Any other call throws `UnsupportedOperationException` with the method's name: the store only ever asks for a connection, so anything else would be a mistake worth seeing.
+
+In version 1.0.0 the tests pointed H2 at port 1 of the machine and relied on nothing listening there. The proxy depends on nothing outside the test, and it fails at once: the two "database is down" tests no longer need seconds.
+
+```java
+  /**
+   * Wraps a data source so that the INSERT of a hold waits until {@code racers} connections have
+   * reached it, and counts rollbacks.
+   *
+   * @param real the database
+   * @param racers how many connections must meet at the INSERT
+   * @param rollbacks counts every rollback on every connection
+   * @return the wrapped data source
+   */
+  static DataSource meetingAtTheInsert(DataSource real, int racers, AtomicInteger rollbacks) {
+    CyclicBarrier barrier = new CyclicBarrier(racers);
+    return (DataSource)
+        Proxy.newProxyInstance(
+            JdbcStandIns.class.getClassLoader(),
+            new Class<?>[] {DataSource.class},
+            (proxy, method, arguments) -> {
+              Object result = invoke(real, method, arguments);
+              return method.getName().equals("getConnection")
+                  ? wrapped((Connection) result, barrier, rollbacks)
+                  : result;
+            });
+  }
+```
+
+`meetingAtTheInsert(real, racers, rollbacks)` wraps the real H2 data source.
+
+- `new CyclicBarrier(racers)` is a barrier for `racers` threads; the tests pass 2.
+- The proxy's handler first calls the same method on the real data source (`invoke`, below). If the method was `getConnection`, it returns the real connection wrapped in a second proxy (`wrapped`); otherwise it returns the real result unchanged. `condition ? a : b` is Java's conditional operator.
+
+```java
+  private static Connection wrapped(
+      Connection real, CyclicBarrier barrier, AtomicInteger rollbacks) {
+    InvocationHandler handler =
+        (proxy, method, arguments) -> {
+          if (method.getName().equals("prepareStatement")
+              && ((String) arguments[0]).startsWith("INSERT INTO holds")) {
+            meet(barrier);
+          }
+          if (method.getName().equals("rollback")) {
+            rollbacks.incrementAndGet();
+          }
+          return invoke(real, method, arguments);
+        };
+    return (Connection)
+        Proxy.newProxyInstance(
+            JdbcStandIns.class.getClassLoader(), new Class<?>[] {Connection.class}, handler);
+  }
+```
+
+`wrapped(real, barrier, rollbacks)` builds the connection proxy. Its handler looks at each call:
+
+- `prepareStatement` with SQL text that starts with `INSERT INTO holds`: the store is about to insert the hold row. The handler calls `meet(barrier)` and waits there until the other racer arrives too. `(String) arguments[0]` reads the first argument, the SQL text; the cast `(String)` tells Java its type.
+- `rollback`: the transaction is being undone; the counter goes up.
+- Every call, after that, goes on to the real connection.
+
+So both racers have done everything up to the `INSERT` (read the key, taken their seat) before either of them inserts.
+
+```java
+  private static void meet(CyclicBarrier barrier) throws SQLException {
+    try {
+      barrier.await(BARRIER_SECONDS, TimeUnit.SECONDS);
+    } catch (InterruptedException interrupted) {
+      Thread.currentThread().interrupt();
+      throw new SQLException("interrupted at the test barrier", interrupted);
+    } catch (BrokenBarrierException | TimeoutException notMet) {
+      throw new SQLException("the racers never met at the INSERT", notMet);
+    }
+  }
+```
+
+`meet(barrier)` waits at most 10 seconds. If the thread is interrupted, it sets the interrupt flag again (so the interruption is not lost) and throws an `SQLException`. If the barrier is **broken** (another waiting thread gave up) or the time runs out, it throws `SQLException("the racers never met at the INSERT", ...)`. Turning these into `SQLException` lets them travel the store's normal error path, so a test that cannot set up its race fails with that sentence instead of hanging.
+
+```java
+  private static Object invoke(Object target, Method method, Object[] arguments) throws Throwable {
+    try {
+      return method.invoke(target, arguments);
+    } catch (InvocationTargetException thrown) {
+      // The real exception, such as the database's own SQLException, not the reflection wrapper.
+      throw thrown.getCause();
+    }
+  }
+}
+```
+
+`invoke(target, method, arguments)` calls the method on the real object with `method.invoke`. When that method throws, reflection wraps the exception in an `InvocationTargetException`. The `catch` unwraps it and throws the real one, as the comment says, so the store sees H2's own `SQLException` with its SQLState, for example `23505`. `throws Throwable` allows any exception to pass.
 
 ### `seatwave/JdbcHoldStoreTest.java`
 
@@ -51,6 +207,10 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import com.github.sviperll.result4j.Result;
+import java.sql.Connection;
+import java.sql.ResultSet;
+import java.sql.SQLException;
+import java.sql.Statement;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
@@ -63,12 +223,14 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+import javax.sql.DataSource;
 import org.h2.jdbcx.JdbcDataSource;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 ```
 
-The imports. `JdbcDataSource` is H2's data source. `Callable` is a task that returns a value (a `Runnable` that gives an answer). `Set` and `HashSet` are used to count distinct hold ids.
+The imports. `JdbcDataSource` is H2's data source. `Callable` is a task that returns a value (a `Runnable` that gives an answer). `Set` and `HashSet` are used to count distinct hold ids. New in 1.1.0: `Connection`, `ResultSet`, `SQLException`, `Statement` and `DataSource` from the JDBC library, for the count of held seats; `AtomicInteger` for the count of rollbacks.
 
 ```java
 class JdbcHoldStoreTest {
@@ -231,9 +393,64 @@ This is the module's invariant in database form. It passes because the `UPDATE`'
 
 **`answersRacingRetriesOfOneKeyWithOneHold`.** Sixteen racers with the same key, the same fingerprint and the same seat `C-1`. Every outcome must be a granted hold (the helper `granted` fails on a refusal), and the set of distinct hold ids must have exactly one element: one hold, fifteen replays.
 
-Which code path does this exercise? The racers' `UPDATE`s queue behind one row lock. Those that wait find the seat held, change zero rows, and then re-read the key and replay. That is the branch in `holdInTransaction` (the re-read after a lost race). It is **not** the `catch` for the unique violation in `hold`. JaCoCo shows lines 98 to 101 and 105 to 109 of `JdbcHoldStore.java` as never run by any test, and I confirmed it with a scratch program that ran the same race (sixteen threads, one key, one seat) while counting `rollback()` calls: the count was 0.
+Which code path does this exercise? The racers' `UPDATE`s queue behind one row lock on the seat. Those that wait find the seat held, change zero rows, and then re-read the key and replay. That is the branch in `holdInTransaction` (the re-read after a lost race). It is **not** the `catch` for the unique violation in `hold`; the next two tests reach that one.
 
-A test for that branch is missing. I ran one by hand: sixteen threads, **one key and sixteen different seats**. Each racer takes its own seat, and then all try to insert a `holds` row with the same key. One insert passes, fifteen fail with SQLState `23505`, roll back (which frees their seat), re-read and replay. Result: sixteen granted holds, 15 `rollback()` calls, exactly one seat `HELD` and exactly one row in `holds`, on every one of four runs. So the code works on H2. A permanent test with those three assertions would pin it.
+```java
+  @Test
+  void answersTheLoserOfAKeyRaceWithTheWinnersHoldAndReleasesItsSeat() throws Exception {
+    // Two requests with one key take two different seats, so no row lock orders them; both reach
+    // the INSERT, and the unique key refuses the second (SQLState 23505). The same fingerprint
+    // makes the loser a retry of the winner, so it must answer the winner's hold.
+    AtomicInteger rollbacks = new AtomicInteger();
+    JdbcHoldStore racing =
+        new JdbcHoldStore(
+            JdbcStandIns.meetingAtTheInsert(dataSource, 2, rollbacks), clock, CHECK_TIMEOUT);
+
+    List<Result<GrantedHold, HoldRefusal>> outcomes =
+        race(racing, 2, racer -> command("\"one-key\"", SHA_A, racer == 0 ? "D-1" : "D-2"));
+
+    GrantedHold first = granted(outcomes.get(0));
+    GrantedHold second = granted(outcomes.get(1));
+    assertThat(first.hold().holdId()).isEqualTo(second.hold().holdId());
+    assertThat(List.of(first.isReplay(), second.isReplay())).containsExactlyInAnyOrder(true, false);
+    assertThat(rollbacks.get()).isEqualTo(1);
+    assertThat(heldSeats()).isEqualTo(1);
+  }
+```
+
+**`answersTheLoserOfAKeyRaceWithTheWinnersHoldAndReleasesItsSeat`.** New in 1.1.0. The comment explains the setup. Two requests carry one key but ask for two different seats, `D-1` and `D-2`. Each takes its own seat, so no row lock makes one wait for the other, and both reach the `INSERT` of the hold row. The table `holds` has a **unique key** on the idempotency key: the database refuses a second row with the same key, with SQLState `23505` ("unique violation"). The loser's transaction is rolled back, which also frees its seat, and the store then reads the winner's row. Because both requests have the same fingerprint (`SHA_A`), the loser is a retry of the winner and must answer with the winner's hold.
+
+- `JdbcStandIns.meetingAtTheInsert(dataSource, 2, rollbacks)` makes the two racers meet at the `INSERT`, so this race happens on every run. Without the barrier, one request would usually finish before the other started.
+- `race(racing, 2, ...)` runs two racers on that store; racer 0 asks for `D-1`, racer 1 for `D-2` (`racer == 0 ? "D-1" : "D-2"`).
+- Both outcomes must be granted, with the same hold id.
+- `containsExactlyInAnyOrder(true, false)`: one of them is the original and one a replay, in either order.
+- Exactly one rollback happened, and exactly one seat is `HELD` (`heldSeats()`, below): the loser's seat was given back.
+
+In version 1.0.0 no test reached this branch. The mutation check makes the store treat every SQL error as fatal (`if (true)` in place of the SQLState test), and this test fails.
+
+```java
+  @Test
+  void refusesTheLoserOfAKeyRaceWithAnotherBodyAndHoldsOneSeat() throws Exception {
+    AtomicInteger rollbacks = new AtomicInteger();
+    JdbcHoldStore racing =
+        new JdbcHoldStore(
+            JdbcStandIns.meetingAtTheInsert(dataSource, 2, rollbacks), clock, CHECK_TIMEOUT);
+
+    List<Result<GrantedHold, HoldRefusal>> outcomes =
+        race(
+            racing,
+            2,
+            racer ->
+                command("\"one-key\"", racer == 0 ? SHA_A : SHA_B, racer == 0 ? "E-1" : "E-2"));
+
+    assertThat(outcomes).filteredOn(outcome -> outcome instanceof Result.Success<?, ?>).hasSize(1);
+    assertThat(outcomes).contains(Result.error(new HoldRefusal.KeyReused()));
+    assertThat(rollbacks.get()).isEqualTo(1);
+    assertThat(heldSeats()).isEqualTo(1);
+  }
+```
+
+**`refusesTheLoserOfAKeyRaceWithAnotherBodyAndHoldsOneSeat`.** The same race, but the two requests have different fingerprints (`SHA_A` and `SHA_B`) and seats `E-1` and `E-2`: one key reused for two different requests. Exactly one outcome must be a success, and the other must be `KeyReused`. Again one rollback, and one seat held.
 
 ```java
   @Test
@@ -267,7 +484,7 @@ Two tests of the readiness check.
   }
 ```
 
-**`turnsADatabaseFailureIntoStoreUnavailable`.** On the unreachable store, `hold(...)` must throw `StoreUnavailableException` whose message contains `A-7`, and `find(...)` must throw the same type. `assertThatThrownBy(() -> ...)` runs the lambda and checks the exception. Both calls together take about 2.8 seconds on this machine.
+**`turnsADatabaseFailureIntoStoreUnavailable`.** On the unreachable store, `hold(...)` must throw `StoreUnavailableException` whose message contains `A-7`, and `find(...)` must throw the same type. `assertThatThrownBy(() -> ...)` runs the lambda and checks the exception.
 
 ```java
   @Test
@@ -282,10 +499,15 @@ Two tests of the readiness check.
 
 ```java
   private List<Result<GrantedHold, HoldRefusal>> race(RacerCommand commands) throws Exception {
+    return race(store, RACERS, commands);
+  }
+
+  private static List<Result<GrantedHold, HoldRefusal>> race(
+      JdbcHoldStore store, int racers, RacerCommand commands) throws Exception {
     CountDownLatch go = new CountDownLatch(1);
     List<Future<Result<GrantedHold, HoldRefusal>>> futures = new ArrayList<>();
-    try (ExecutorService threads = Executors.newFixedThreadPool(RACERS)) {
-      for (int racer = 0; racer < RACERS; racer++) {
+    try (ExecutorService threads = Executors.newFixedThreadPool(racers)) {
+      for (int racer = 0; racer < racers; racer++) {
         HoldCommand command = commands.forRacer(racer);
         Callable<Result<GrantedHold, HoldRefusal>> attempt =
             () -> {
@@ -304,13 +526,13 @@ Two tests of the readiness check.
   }
 ```
 
-`race(...)` is the helper.
+`race(...)` is the helper, now in two forms. The short one runs `RACERS` (16) racers on the test's own store. The long one takes the store and the number of racers, so the key-race tests can pass their barrier store and 2. It is `static`, because it uses only its parameters.
 
 1. A latch `go` of size 1 and an empty list of futures.
-2. A fixed pool of 16 threads (closed by the `try` at the end).
+2. A fixed pool of `racers` threads (closed by the `try` at the end).
 3. For each racer, it builds the command first (`commands.forRacer(racer)`), then submits a `Callable` that waits at `go.await()` and then calls `store.hold(command)`.
 4. When all are submitted, `go.countDown()` releases them together. This gives the best chance of a real overlap.
-5. It collects each result with `future.get(30, SECONDS)`. A thread that threw would make `get` throw, and the test would fail with that error.
+5. It collects each result with `future.get(30, SECONDS)`, in the order the racers were made, so `outcomes.get(0)` belongs to racer 0. A thread that threw would make `get` throw, and the test would fail with that error.
 
 ```java
   private static HoldCommand command(String key, String fingerprint, String seat) {
@@ -335,16 +557,27 @@ Two tests of the readiness check.
     HoldCommand forRacer(int racer);
   }
 
-  private static JdbcDataSource unreachable() {
-    // Port 1 on this machine: nothing listens there, so every connection is refused at once.
-    JdbcDataSource down = new JdbcDataSource();
-    down.setURL("jdbc:h2:tcp://127.0.0.1:1/nowhere");
-    return down;
+  private long heldSeats() throws SQLException {
+    try (Connection connection = dataSource.getConnection();
+        Statement statement = connection.createStatement();
+        ResultSet rows =
+            statement.executeQuery("SELECT COUNT(*) FROM seats WHERE status = 'HELD'")) {
+      rows.next();
+      return rows.getLong(1);
+    }
+  }
+
+  private static DataSource unreachable() {
+    return JdbcStandIns.unreachable();
   }
 }
 ```
 
-`RacerCommand` is a one-method interface (`@FunctionalInterface`), so the tests can pass a lambda `racer -> command(...)`. `unreachable()` returns an H2 data source with the URL `jdbc:h2:tcp://127.0.0.1:1/nowhere`: connect to H2's network mode on port 1 of this machine. The comment says why it works: nothing listens on port 1, so every connection is refused. That is an assumption about the machine. If something did listen on port 1, the test would behave differently. A port the test itself opened and closed would be safer.
+`RacerCommand` is a one-method interface (`@FunctionalInterface`), so the tests can pass a lambda `racer -> command(...)`.
+
+`heldSeats()` asks the database directly: `SELECT COUNT(*) FROM seats WHERE status = 'HELD'`, the number of seats in the state `HELD`. The `try ( ... )` opens a connection, a statement and the result rows, and closes all three at the end, in reverse order. `rows.next()` moves to the one row of the answer, and `getLong(1)` reads its first column (JDBC counts columns from 1).
+
+`unreachable()` now returns the proxy of `JdbcStandIns.unreachable()`.
 
 ### `seatwave/SeatWaveServerTest.java`
 
@@ -370,6 +603,8 @@ class SeatWaveServerTest {
 
   private static final Duration DEADLINE = Duration.ofSeconds(10);
   private static final Duration TIMEOUT = Duration.ofSeconds(10);
+  // Short, so the deadline test ends in a fraction of a second instead of the server's 5 s.
+  private static final Duration WORKER_STOP_WAIT = Duration.ofMillis(100);
   private static final String BODY = "{\"eventId\":1,\"seat\":\"A-7\",\"customer\":\"fan-1\"}";
 
   private final ScriptedHoldStore store = new ScriptedHoldStore();
@@ -377,7 +612,7 @@ class SeatWaveServerTest {
   private SeatWaveServer server;
 ```
 
-Imports and fields. `DEADLINE` and `TIMEOUT` are 10 seconds each: safety limits, not expected times. `BODY` is a valid hold request. Each test gets a new `ScriptedHoldStore`, a new `HttpClient` with a connect timeout, and a `server` field set by `start(...)`.
+Imports and fields. `DEADLINE` and `TIMEOUT` are 10 seconds each: safety limits, not expected times. `WORKER_STOP_WAIT` is new in 1.1.0: 100 ms instead of the server's 5 s, so the deadline test ends in a fraction of a second, as the comment says. `BODY` is a valid hold request. Each test gets a new `ScriptedHoldStore`, a new `HttpClient` with a connect timeout, and a `server` field set by `start(...)`.
 
 ```java
   @AfterEach
@@ -449,11 +684,37 @@ This is the test that holds the difference between liveness and readiness.
 
 ```java
   @Test
+  void answersAHeadRequestLikeAGetWithoutABody() throws Exception {
+    start(DEADLINE);
+    server.markReady();
+
+    HttpResponse<String> health =
+        client.send(
+            HttpRequest.newBuilder(URI.create("http://127.0.0.1:" + server.adminPort() + "/health"))
+                .timeout(TIMEOUT)
+                .method("HEAD", HttpRequest.BodyPublishers.noBody())
+                .build(),
+            HttpResponse.BodyHandlers.ofString());
+
+    assertThat(health.statusCode()).isEqualTo(200);
+    assertThat(health.body()).isEmpty();
+  }
+```
+
+**`answersAHeadRequestLikeAGetWithoutABody`.** New in 1.1.0. `HEAD` is the HTTP method that asks for exactly what `GET` would answer, without the body (RFC 9110). Health checkers and some clients use it. The test sends `HEAD /health` to the admin port: `.method("HEAD", HttpRequest.BodyPublishers.noBody())` sets a method that has no shortcut of its own on the builder, with no request body. The status must be `200` and the body empty. In version 1.0.0 the admin port recognized only `GET`, so `HEAD /health` got its not-found answer (`404`), and a hold path answered `HEAD` with `405`, "method not allowed".
+
+```java
+  @Test
   void countsRequestsInItsMetrics() throws Exception {
     start(DEADLINE);
     server.markReady();
     hold("\"k-1\"");
 
+    // The server counts a request after it has written the answer, so the client can read the
+    // metrics a moment before the count; wait for it instead of racing it.
+    await()
+        .atMost(TIMEOUT)
+        .until(() -> admin("/metrics").body().contains("seatwave_request_seconds_count 1"));
     String metrics = admin("/metrics").body();
 
     assertThat(metrics)
@@ -465,7 +726,7 @@ This is the test that holds the difference between liveness and readiness.
 
 **`countsRequestsInItsMetrics`.** After one hold, `GET /metrics` must contain `seatwave_requests_total{route="POST /v1/holds",status="201"} 1`, `seatwave_state{state="ready"} 1` and `seatwave_request_seconds_count 1`.
 
-A theoretical race: the server writes the reply and only afterwards counts the request (`metrics.finished`). A client that reads `/metrics` fast enough, on the other thread, could see the counter before it moves. I ran a program that did 3,000 POST-then-metrics pairs, three times, and the counter was always already there (0 misses in 9,000 pairs), so the window is far too small to see in practice. It is still a window.
+The `await()` before the read is new in 1.1.0, and the comment explains it. The server writes the reply first and counts the request afterwards, on its own thread. A client that asks for `/metrics` at once can, in a rare case, arrive between the two. The test now waits (at most 10 s) until the counter shows 1, then reads the metrics it checks. In version 1.0.0 this window was left open.
 
 ```java
   @Test
@@ -486,7 +747,10 @@ A theoretical race: the server writes the reply and only afterwards counts the r
     assertThat(refused.headers().firstValue("Connection")).contains("close");
     assertThat(refused.body()).contains("nothing was done");
     assertThat(inFlight.get(TIMEOUT.toSeconds(), TimeUnit.SECONDS).statusCode()).isEqualTo(201);
-    assertThat(drained.get(TIMEOUT.toSeconds(), TimeUnit.SECONDS).isClean()).isTrue();
+    Lifecycle.DrainResult result = drained.get(TIMEOUT.toSeconds(), TimeUnit.SECONDS);
+    assertThat(result.isClean()).isTrue();
+    // Woken by the last request's release, not by the 10 s deadline (a lost wake-up is also clean).
+    assertThat(result.waited()).isLessThan(DEADLINE.dividedBy(2));
     assertThat(server.notAdmittedCount()).isEqualTo(1);
   }
 ```
@@ -499,12 +763,19 @@ A theoretical race: the server writes the reply and only afterwards counts the r
 4. A new hold is sent. Then `store.releaseHolds()` lets the blocked request finish.
 5. The new request must have status `503`, a `Connection: close` header and a body with `nothing was done`.
 6. The old request must end with `201`: it was admitted before the drain and was allowed to finish.
-7. The drain result must be clean, and `notAdmittedCount()` must be exactly 1.
+7. The drain result must be clean, and, new in 1.1.0, `waited()` must be under half the 10 s deadline: the release of the last request woke the drain, as the comment says ("a lost wake-up is also clean"). The mutation check removes the wake-up, the drain sleeps to its deadline, and this test fails.
+8. `notAdmittedCount()` must be exactly 1.
 
 ```java
   @Test
   void stopsAtTheDeadlineWhenARequestNeverFinishes() throws Exception {
-    start(Duration.ofMillis(200));
+    server =
+        SeatWaveServer.start(
+            TestSettings.withDrainDeadline(Duration.ofMillis(200)),
+            "seatwave-test",
+            store,
+            new MutableClock(Instant.parse("2026-11-11T09:00:00Z")),
+            WORKER_STOP_WAIT);
     server.markReady();
     store.blockHolds();
     holdAsync("\"stuck\"");
@@ -513,11 +784,14 @@ A theoretical race: the server writes the reply and only afterwards counts the r
     Lifecycle.DrainResult result = server.drainAndStop(Duration.ofMillis(200));
 
     assertThat(result.inFlightLeft()).isEqualTo(1);
+    assertThat(result.waited()).isGreaterThanOrEqualTo(Duration.ofMillis(200));
     assertThat(server.state()).isEqualTo(LifecycleState.STOPPED);
   }
 ```
 
-**`stopsAtTheDeadlineWhenARequestNeverFinishes`.** Deadline 200 ms. A held request is in the store and never released. `drainAndStop(200 ms)` must return after the deadline with `inFlightLeft()` equal to 1, and the state must be `STOPPED`. It takes about five seconds because the pool waits `WORKER_STOP_SECONDS` (5) for the blocked worker before it interrupts it.
+**`stopsAtTheDeadlineWhenARequestNeverFinishes`.** Deadline 200 ms. The server is started with the five-argument `SeatWaveServer.start`, which takes the worker stop wait, here 100 ms. A held request is in the store and never released. `drainAndStop(200 ms)` must return with `inFlightLeft()` equal to 1, `waited()` at least 200 ms (the drain really waited for its deadline), and the state must be `STOPPED`.
+
+In version 1.0.0 this test took about five seconds, because after the deadline the server waits `WORKER_STOP_WAIT` (5 s with the shipped code) for the blocked worker before it interrupts it. With 100 ms it ends in about a third of a second.
 
 ```java
   private void start(Duration deadline) throws IOException {
@@ -538,7 +812,7 @@ A theoretical race: the server writes the reply and only afterwards counts the r
   }
 ```
 
-The helpers. `start(deadline)` builds a server on loopback with port 0, the instance name `seatwave-test`, the scripted store and a `MutableClock` fixed at 09:00. `hold(key)` sends a request and waits for the reply as a `String`; `holdAsync(key)` returns the `CompletableFuture`.
+The helpers. `start(deadline)` builds a server on loopback with port 0, the instance name `seatwave-test`, the scripted store and a `MutableClock` fixed at 09:00. It uses the four-argument `start`, so the server's own 5 s worker wait applies; only the deadline test needs a shorter one. `hold(key)` sends a request and waits for the reply as a `String`; `holdAsync(key)` returns the `CompletableFuture`.
 
 ```java
   private HttpRequest holdRequest(String key) {
@@ -658,7 +932,56 @@ The routes are made with the scripted store, a real `JsonCodec` and a clock fixe
   }
 ```
 
-**`refusesAnUnknownField`.** An extra field `x` gives `400` and a body containing `/x is not a field`. This is the only test that goes through `JsonCodec`'s refusal branches in this package, which is why JaCoCo shows 22 of the codec's 50 lines as never run. No test sends an empty body, a list, trailing text, a repeated field, a text for a number or a number too large.
+**`refusesAnUnknownField`.** An extra field `x` gives `400` and a body containing `/x is not a field`. The codec's other refusals are tested on their own in `JsonCodecTest` (`tests-tools-walkthrough-2.md`).
+
+```java
+  @Test
+  void startsAWholeBodyProblemWithTheReasonNotASpace() {
+    Reply reply = post("application/json", KEY, "[1]");
+
+    assertThat(reply.status()).isEqualTo(400);
+    assertThat(reply.bodyText()).contains("\"detail\":\"the body must be a JSON object\"");
+  }
+```
+
+**`startsAWholeBodyProblemWithTheReasonNotASpace`.** New in 1.1.0. The body `[1]` is valid JSON but not an object. The problem is about the whole body, so its pointer is empty. The routes build the `detail` of a `400` as "pointer, space, reason", and in version 1.0.0 an empty pointer left a leading space: `" the body must be a JSON object"`. The test pins the exact text `"detail":"the body must be a JSON object"`, quotes included, so a space after the opening quote fails it. The mutation check puts the old form back, and this test fails.
+
+```java
+  @Test
+  void namesARepeatedField() {
+    Reply reply = post("application/json", KEY, "{\"eventId\":1,\"eventId\":2}");
+
+    assertThat(reply.bodyText()).contains("\"detail\":\"/eventId appears more than once\"");
+  }
+```
+
+**`namesARepeatedField`.** New in 1.1.0. `{"eventId":1,"eventId":2}` names `eventId` twice. The detail must be `/eventId appears more than once`: the pointer, a space, and the reason.
+
+```java
+  @Test
+  void readsAHoldWithHeadAsWithGet() {
+    Reply reply =
+        routes
+            .route(
+                new Request(
+                    "HEAD",
+                    "/v1/holds/11111111-2222-3333-4444-555555555555",
+                    "",
+                    "",
+                    "",
+                    new byte[0],
+                    false,
+                    "c1"))
+            .reply();
+
+    // The same answer as a GET of the same path: the server leaves only the body out.
+    assertThat(reply.status())
+        .isEqualTo(get("/v1/holds/11111111-2222-3333-4444-555555555555", "").status());
+    assertThat(reply.status()).isNotEqualTo(405);
+  }
+```
+
+**`readsAHoldWithHeadAsWithGet`.** New in 1.1.0. A `HEAD` request for a hold path is routed like a `GET`. The check asks that the `HEAD` reply has the same status as a `GET` of the same path (`get(path, "")`, the helper at the end of the class), and that it is not `405`, the answer for a method the path does not take. (The scripted store knows this id, so both are `200`.) The server, not the routes, leaves the body out when it writes a `HEAD` reply; `SeatWaveServerTest.answersAHeadRequestLikeAGetWithoutABody` checks that part.
 
 ```java
   @Test
@@ -757,11 +1080,11 @@ Three tests map a store refusal to a status, using the trigger seats of `Scripte
 
     assertThat(onHolds.status()).isEqualTo(405);
     assertThat(onHolds.header("Allow")).isEqualTo("POST");
-    assertThat(onHold.header("Allow")).isEqualTo("GET");
+    assertThat(onHold.header("Allow")).isEqualTo("GET, HEAD");
   }
 ```
 
-**`answersMethodNotAllowedWithTheAllowedMethod`.** `GET /v1/holds` gives `405` with `Allow: POST`. `DELETE` on a hold path gives `Allow: GET`. The second request is built with the record constructor spread over many lines; its eight arguments are the method, the path, the query, the content type, the key, the body, the too-large flag and the correlation id.
+**`answersMethodNotAllowedWithTheAllowedMethod`.** `GET /v1/holds` gives `405` with `Allow: POST`. `DELETE` on a hold path gives `Allow: GET, HEAD` since 1.1.0 (it said `GET` before `HEAD` was answered): the `Allow` header must list every method the path accepts. The second request is built with the record constructor spread over many lines; its eight arguments are the method, the path, the query, the content type, the key, the body, the too-large flag and the correlation id.
 
 ```java
   @Test
@@ -804,24 +1127,23 @@ Three tests map a store refusal to a status, using the trigger seats of `Scripte
 
 The helpers. `post(contentType, key, body)` builds a `Request` for `POST /v1/holds` (body as UTF-8 bytes, not too large, correlation id `c1`) and returns the reply. `get(path, query)` does the same for a `GET`. `body(seat)` builds a valid body for any seat.
 
-What these tests leave out: the leading space in the `400` detail for whole-body problems (see `java-seatwave-walkthrough-2.md`); the `expired` state of a hold (the shared clock never moves, and JaCoCo marks `HoldView.of` as not fully covered); a replayed hold's log line; the missing `Content-Type`; and an upper-case UUID in the path.
+What these tests leave out: the `expired` state of a hold (the shared clock never moves); a replayed hold's log line; the missing `Content-Type`; and an upper-case UUID in the path.
 
 ## Try it yourself
 
 All commands run in the project folder. Timings differ on every run.
 
-1. Run the three classes. Thirty-five tests pass.
+1. Run the three classes. Forty-one tests pass.
 
 ```bash
 ./gradlew --offline cleanTest test --tests '*JdbcHoldStoreTest' --tests '*SeatWaveServerTest' --tests '*HoldRoutesTest' 2>&1 | grep -cE "PASSED"
 ```
 
-It prints `35`.
+It prints `41`.
 
-2. Show that the store's tests take their time from the two "database is down" tests and the deadline test. This lists the slowest tests of the last full run.
+2. See how long the slowest tests of these classes take. This lists them from the last run.
 
 ```bash
-./gradlew --offline cleanTest test > /dev/null 2>&1
 python3 -c "
 import glob,re
 rows=[]
@@ -832,11 +1154,15 @@ for r in sorted(rows,reverse=True)[:3]: print(r)
 "
 ```
 
+On the run for these notes:
+
 ```text
-(5.219, 'SeatWaveServerTest', 'stopsAtTheDeadlineWhenARequestNeverFinishes()')
-(2.779, 'JdbcHoldStoreTest', 'turnsADatabaseFailureIntoStoreUnavailable()')
-(1.393, 'JdbcHoldStoreTest', 'saysTheDatabaseIsUnreachableWhenNoConnectionCanBeHad()')
+(0.405, 'JdbcHoldStoreTest', 'letsExactlyOneOfManyRacersHoldOneSeat()')
+(0.323, 'SeatWaveServerTest', 'stopsAtTheDeadlineWhenARequestNeverFinishes()')
+(0.18, 'SeatWaveServerTest', 'finishesTheRequestInFlightAndRefusesNewOnesWhileDraining()')
 ```
+
+The seat race starts sixteen threads; the deadline test waits its 200 ms deadline and its 100 ms worker wait; the drain test waits for a request in flight. In version 1.0.0 the top three took 5.219 s, 2.779 s and 1.393 s: the deadline test waited the full 5 s worker wait, and the two "database is down" tests waited for a refused connection to port 1. The proxy now fails at once.
 
 3. Break the race rule and watch the race test fail. Copy the project, remove the `WHERE` part that makes the `UPDATE` conditional, and run the store tests.
 
@@ -849,25 +1175,40 @@ sed -i.bak "s/AND (status = 'AVAILABLE' OR (status = 'HELD' AND hold_expires_at 
 cd ../.. && rm -rf build/rule-check
 ```
 
-The `UPDATE` now takes any seat regardless of its status. Two tests fail in the run for these notes: `refusesASeatAnotherActiveHoldOwns` and `letsExactlyOneOfManyRacersHoldOneSeat`, the two that need a refusal.
+In the run for these notes:
 
-4. Send a real request through the real server in a test, by running only the server tests, and read the log. The test output of Gradle hides the log lines; the pass or fail list is what you see.
-
-```bash
-./gradlew --offline cleanTest test --tests '*SeatWaveServerTest' 2>&1 | grep -E "PASSED|FAILED|BUILD"
+```text
+JdbcHoldStoreTest > letsExactlyOneOfManyRacersHoldOneSeat() FAILED
+JdbcHoldStoreTest > refusesASeatAnotherActiveHoldOwns() FAILED
+> Task :test FAILED
+BUILD FAILED in 4s
 ```
 
-Six `PASSED` lines and `BUILD SUCCESSFUL`.
+The `UPDATE` now takes any seat regardless of its status, so the tests that need a refusal fail.
+
+4. Break the duplicate-key branch the same way, in a copy: replace `if (!UNIQUE_VIOLATION.equals(failure.getSQLState())) {` with `if (true) {` in `JdbcHoldStore.java` and run `--tests '*JdbcHoldStoreTest'`.
+
+In the run for these notes the two key-race tests fail, and no other:
+
+```text
+JdbcHoldStoreTest > refusesTheLoserOfAKeyRaceWithAnotherBodyAndHoldsOneSeat() FAILED
+JdbcHoldStoreTest > answersTheLoserOfAKeyRaceWithTheWinnersHoldAndReleasesItsSeat() FAILED
+> Task :test FAILED
+BUILD FAILED in 2s
+```
+
+In version 1.0.0 no test failed with this change. Undo it.
 
 ## Mistakes people make
 
-- **Racing on one key and one seat and believing every path was tested.** The test of racing retries takes the "wait and re-read" branch, not the duplicate-key branch. Choose the race inputs to reach the branch you want, and check with a coverage report.
+- **Racing on one key and one seat and believing every path was tested.** That race takes the "wait and re-read" branch, not the duplicate-key branch. Choose the race inputs to reach the branch you want (here: one key, two seats), and force the timing with a barrier when chance would rarely give it.
 - **A fixed sleep before checking.** The drain test waits with `await()` for the state `DRAINING` and with latches for the request to enter the store, not with `sleep`.
 - **Leaving a request blocked.** `@AfterEach` releases the fake store first, or a stuck worker would hold the next test's port.
-- **Assuming port 1 is closed.** `unreachable()` depends on it.
-- **Reading metrics after the fact and assuming the counter is final.** The counter is moved after the reply is written; the window is tiny, but it is not zero.
+- **Depending on the machine for a failure.** Version 1.0.0 assumed nothing listened on port 1. The proxy data source fails by itself.
+- **Reading metrics before they are written.** The counter moves after the reply; `countsRequestsInItsMetrics` now waits for it.
 - **Asserting only on the status.** The route tests also check `Retry-After`, `Allow`, `Location`, `Cache-Control` and `Connection`, because the balancer and the clients read those.
-- **Testing against a convenient database and calling it proof.** These store tests run on H2. `StackTest` runs the rule on PostgreSQL.
+- **Asserting the result of a drain but not its time.** A lost wake-up ends "clean", only late. The drain tests check `waited()`.
+- **Testing against a convenient database and calling it proof.** These store tests run on H2. `StackTest` runs the one-owner rule and the key race on PostgreSQL.
 
 ## Check yourself
 
@@ -875,19 +1216,22 @@ Six `PASSED` lines and `BUILD SUCCESSFUL`.
    Answer: `Result.error(new HoldRefusal.SeatTaken())`. `Result` and the refusal types are records, which compare by content.
 2. Why does the drain test wait for `awaitHoldEntered()` before it starts draining?
    Answer: to be sure a request is really inside the store, in flight, before the drain starts; otherwise the drain could finish before the request arrives and prove nothing.
-3. Which branch of `JdbcHoldStore.hold` does no test run, and what input would run it?
-   Answer: the `catch` for SQLState `23505`. Racing threads with one key and different seats run it.
-4. What does `answersNotFoundForAnUnknownPathWhateverTheMethod` pin?
-   Answer: a `POST` to an unknown path is `404`, not `405`.
-5. Why does `stopsAtTheDeadlineWhenARequestNeverFinishes` take about five seconds?
-   Answer: after the drain deadline, `drainAndStop` waits up to five seconds for the worker pool to end; the blocked worker only ends when it is interrupted after that wait.
+3. Why do the key-race tests give the two racers different seats?
+   Answer: with one seat, the row lock on the seat makes one racer wait and the duplicate-key branch is never reached; with two seats both reach the `INSERT`, and the unique key refuses the second with `23505`.
+4. What does `JdbcStandIns.meetingAtTheInsert` add to a real data source?
+   Answer: a wait at a barrier before the `INSERT INTO holds`, until both racers are there, and a count of rollbacks; every call still goes to the real H2 connection.
+5. Why does `stopsAtTheDeadlineWhenARequestNeverFinishes` now take a fraction of a second instead of about five?
+   Answer: it starts the server with a worker stop wait of 100 ms instead of the shipped 5 s.
 
 ## Further reading
 
 - Java SE 25 API, `java.net.http.HttpClient`: https://docs.oracle.com/en/java/javase/25/docs/api/java.net.http/java/net/http/HttpClient.html
 - Java SE 25 API, `CompletableFuture`: https://docs.oracle.com/en/java/javase/25/docs/api/java.base/java/util/concurrent/CompletableFuture.html
-- Java SE 25 API, `java.util.concurrent.ExecutorService`: https://docs.oracle.com/en/java/javase/25/docs/api/java.base/java/util/concurrent/ExecutorService.html
+- Java SE 25 API, `java.util.concurrent.CyclicBarrier`: https://docs.oracle.com/en/java/javase/25/docs/api/java.base/java/util/concurrent/CyclicBarrier.html
+- Java SE 25 API, `java.lang.reflect.Proxy` (dynamic proxies): https://docs.oracle.com/en/java/javase/25/docs/api/java.base/java/lang/reflect/Proxy.html
+- Java SE 25 API, `java.sql.SQLException` (SQLState): https://docs.oracle.com/en/java/javase/25/docs/api/java.sql/java/sql/SQLException.html
 - H2 2.5 documentation, transaction isolation and locking: https://h2database.com/html/advanced.html
-- PostgreSQL 18 documentation, transaction isolation: https://www.postgresql.org/docs/18/transaction-iso.html
+- PostgreSQL 18 documentation, error codes (23505 `unique_violation`): https://www.postgresql.org/docs/18/errcodes-appendix.html
+- RFC 9110, HTTP semantics, `HEAD` and `Allow`: https://www.rfc-editor.org/rfc/rfc9110#name-head
 - AssertJ core documentation: https://assertj.github.io/doc/
 - JUnit 6 user guide: https://docs.junit.org/current/user-guide/

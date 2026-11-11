@@ -10,7 +10,7 @@ A **terminal** is a window where you type commands. The word after the program n
 
 ## Why this repository uses it
 
-The hands-on project of Module 10 must build and test with one command and the same result on every machine, and it must not need Docker for that. Gradle gives that: `./gradlew check` checks the formatting of the code, compiles it with every warning turned into an error, runs 98 tests and fails if the line coverage is below 80 percent. The build file also gives each of the two Java tools (the load harness and the rolling deploy) its own task, so a learner types one short command instead of assembling a long Java command line. It keeps the tests that need the running Compose stack out of `check` (they have their own task, `stackTest`), so the gate takes seconds and needs no Docker. And one task prepares the Docker side without Docker: `stackFiles` collects the jars the container image copies. SeatWave itself has no task, because an instance needs the shared database and so runs only inside the Compose stack.
+The hands-on project of Module 10 must build and test with one command and the same result on every machine, and it must not need Docker for that. Gradle gives that: `./gradlew check` checks the formatting of the code, compiles it with every warning turned into an error, runs 152 tests and fails if the line coverage is below 80 percent. The build file also gives each of the two Java tools (the load harness and the rolling deploy) its own task, so a learner types one short command instead of assembling a long Java command line. It keeps the tests that need the running Compose stack out of `check` (they have their own task, `stackTest`), so the gate takes seconds and needs no Docker. And one task prepares the Docker side without Docker: `stackFiles` collects the jars the container image copies. SeatWave itself has no task, because an instance needs the shared database and so runs only inside the Compose stack.
 
 ## Where it appears
 
@@ -77,10 +77,10 @@ plugins {
 
 ```kotlin
 group = "io.plainround"
-version = "1.0.0"
+version = "1.1.0"
 ```
 
-`group` and `version` are the project's own identity in the Maven style: a group, a name (from `settings.gradle.kts`) and a version. They matter in one visible place: `version = "1.0.0"` is part of the name of the jar, `seatwave-balancer-1.0.0.jar`, that `stackFiles` collects. The `Dockerfile` names that jar and `compose.yaml` names the image `seatwave-balancer-seatwave:1.0.0`, so the three change together.
+`group` and `version` are the project's own identity in the Maven style: a group, a name (from `settings.gradle.kts`) and a version. They matter in one visible place: `version = "1.1.0"` is part of the name of the jar, `seatwave-balancer-1.1.0.jar`, that `stackFiles` collects. The `Dockerfile` names that jar and `compose.yaml` names the images `seatwave-balancer-seatwave:1.1.0` and `seatwave-balancer-keepalived:1.1.0`, so they all change together. The review pass that made version 1.1.0 changed all of them at once.
 
 ### The Java toolchain
 
@@ -204,8 +204,14 @@ tasks.test {
     }
     systemProperty("seatwave.schema", file("db/schema.sql").absolutePath)
     systemProperty("seatwave.haproxy", file("haproxy/haproxy.cfg").absolutePath)
+    // Every file a test reads is an input, so a change to any of them runs the tests again
+    // (the configuration rules read compose.yaml, both Dockerfiles and the settings files).
     inputs.file("db/schema.sql")
     inputs.file("haproxy/haproxy.cfg")
+    inputs.file("compose.yaml")
+    inputs.file("Dockerfile")
+    inputs.dir("keepalived")
+    inputs.dir("config")
     testLogging {
         events("passed", "failed", "skipped")
     }
@@ -217,7 +223,10 @@ tasks.test {
 - `tasks.test { ... }` configures the existing task named `test`.
 - `useJUnitPlatform { excludeTags("stack") }` tells it to run tests through the JUnit Platform, and to skip every test marked `@Tag("stack")`. Without `useJUnitPlatform` Gradle would look for older JUnit 4 tests and find none.
 - `systemProperty("seatwave.schema", file("db/schema.sql").absolutePath)` is how the tests find the database schema. A **system property** is a named text value that Gradle gives to the test JVM, like a variable that every class can read. The value is an absolute path to `db/schema.sql` of the checkout, so it does not matter which folder the test JVM starts in. `systemProperty("seatwave.haproxy", file("haproxy/haproxy.cfg").absolutePath)` does the same for the balancer's configuration file, which a test reads and checks (`tests-stack-walkthrough.md`).
-- `inputs.file("db/schema.sql")` and `inputs.file("haproxy/haproxy.cfg")` tell Gradle that these two files are inputs of the task: if either changes, `test` is not up to date and runs again.
+- The two comment lines above the inputs give the rule: "Every file a test reads is an input, so a change to any of them runs the tests again". Gradle keeps a record of each task's **inputs** (the files it reads) and **outputs** (the files it writes). When none of them changed since the last run, the task is **up to date** and Gradle skips it. Gradle sees the source and test classes by itself, but not a file that a test opens by its path, so those files are declared here by hand.
+- `inputs.file("db/schema.sql")` and `inputs.file("haproxy/haproxy.cfg")` declare the two files the system properties above point to.
+- `inputs.file("compose.yaml")` and `inputs.file("Dockerfile")` declare the two files that the configuration rules (`InfrastructureRulesTest`, `tests-config-walkthrough.md`) read and check, such as the pinned image digests and the stop grace period.
+- `inputs.dir("keepalived")` and `inputs.dir("config")` declare whole folders: every file in them counts. `keepalived/` holds the second Dockerfile and the two VRRP files, and `config/` holds the settings files the tests read. Version 1.0.0 declared only the first two files, so a change to, say, `compose.yaml` alone left `test` up to date and the rules that check it did not run again.
 - `testLogging { events("passed", "failed", "skipped") }` prints one line per test result while the task runs, for example `ServiceSettingsTest > refusesAHostNameAsTheBindAddress() PASSED`. Without it, only failures show.
 - `finalizedBy(tasks.jacocoTestReport)` means: after `test` finishes, always run `jacocoTestReport`, even if tests failed. That creates the coverage report in `build/reports/jacoco/test/html`.
 
@@ -284,7 +293,7 @@ tasks.check {
 
 - `tasks.jacocoTestCoverageVerification` is the task that checks coverage against a rule. `dependsOn(tasks.test)` makes sure the tests have run, so there is coverage data to read.
 - `violationRules { rule { limit { ... } } }` is the rule. A **limit** names a counter, here `counter = "LINE"`, and a bound. `minimum = "0.80".toBigDecimal()` means the covered share of lines must be at least 0.80. `.toBigDecimal()` turns the text into an exact decimal number, which the plugin requires. The comment explains that the untested remainder is the command-line entry points.
-- `tasks.check { dependsOn(tasks.jacocoTestCoverageVerification) }` adds the coverage check to `check`. By default `check` does not run it, so this line is what makes the floor a real gate. I proved it in a scratch copy: with the minimum raised to 0.95 the build failed with `Rule violated for bundle seatwave-balancer: lines covered ratio is 0.89, but expected minimum is 0.95`.
+- `tasks.check { dependsOn(tasks.jacocoTestCoverageVerification) }` adds the coverage check to `check`. By default `check` does not run it, so this line is what makes the floor a real gate. I proved it in a scratch copy: with the minimum raised to 0.95 the build failed with `Rule violated for bundle seatwave-balancer: lines covered ratio is 0.93, but expected minimum is 0.95`.
 - `check` is the standard "is this project healthy" task. It runs the tests, `spotlessCheck` and the coverage verification. Neither program task of the next sections is a dependency of it.
 
 ### The stack task
@@ -302,7 +311,7 @@ tasks.register<Sync>("stackFiles") {
 
 - The comment says what `stackFiles` is for: "The jars the container image copies: this project's jar and its runtime libraries, in one folder."
 - `tasks.register<Sync>("stackFiles")` creates a task of the type `Sync`. A `Sync` task copies files into a folder and **deletes** anything else in that folder, so the folder always matches the sources exactly.
-- `from(tasks.jar)` adds the project's own jar, built by the `jar` task, and `from(configurations.runtimeClasspath)` adds every library that the main code needs at run time. `into(layout.buildDirectory.dir("stack/lib"))` is the target, `build/stack/lib`. I ran it and the folder held eleven jars: `HikariCP-7.1.0.jar`, `checker-qual-3.55.1.jar`, `jackson-annotations-2.23.jar`, `jackson-core-2.23.0.jar`, `jackson-databind-2.23.0.jar`, `logback-classic-1.6.6.jar`, `logback-core-1.6.6.jar`, `postgresql-42.7.14.jar`, `result4j-1.2.0.jar`, `seatwave-balancer-1.0.0.jar` and `slf4j-api-2.0.20.jar`. The Dockerfile copies every jar in that folder. The test-only libraries (H2, JUnit and the rest) are not in it, because `runtimeClasspath` does not hold them.
+- `from(tasks.jar)` adds the project's own jar, built by the `jar` task, and `from(configurations.runtimeClasspath)` adds every library that the main code needs at run time. `into(layout.buildDirectory.dir("stack/lib"))` is the target, `build/stack/lib`. I ran it and the folder held eleven jars: `HikariCP-7.1.0.jar`, `checker-qual-3.55.1.jar`, `jackson-annotations-2.23.jar`, `jackson-core-2.23.0.jar`, `jackson-databind-2.23.0.jar`, `logback-classic-1.6.6.jar`, `logback-core-1.6.6.jar`, `postgresql-42.7.14.jar`, `result4j-1.2.0.jar`, `seatwave-balancer-1.1.0.jar` and `slf4j-api-2.0.20.jar`. The Dockerfile copies every jar in that folder. The test-only libraries (H2, JUnit and the rest) are not in it, because `runtimeClasspath` does not hold them.
 - `group = "build"` and `description = ...` file the task in the `build` group of `./gradlew tasks` with its explanatory text. `scripts/stack.sh up` calls it before `docker compose up`.
 
 ### The two program tasks
@@ -329,7 +338,7 @@ entryPoints.forEach { (taskName, entryPoint) ->
 }
 ```
 
-- The comment on line 123 says what the block is for: "One command per example: each entry point gets its own task, so a reader never assembles a classpath." The second comment line says what is missing: "SeatWave itself has none: it needs the shared database, so it runs only in the Compose stack."
+- The comment on line 129 says what the block is for: "One command per example: each entry point gets its own task, so a reader never assembles a classpath." The second comment line says what is missing: "SeatWave itself has none: it needs the shared database, so it runs only in the Compose stack."
 - `val entryPoints = mapOf(...)` creates a read-only map in Kotlin: each pair is a task name and the full name of a class that has a `main` method (an **entry point**, the place where a Java program starts). `"a" to "b"` builds one pair. The two pairs are `load` (`HarnessCli`, the load harness) and `deploy` (`DeployCli`, the rolling deploy). The trailing comma after the last pair is allowed in Kotlin.
 - `entryPoints.forEach { (taskName, entryPoint) -> ... }` runs the block once per pair. The round brackets `(taskName, entryPoint)` take the pair apart into its two parts.
 - `tasks.register<JavaExec>(taskName) { ... }` creates a new task of the type `JavaExec`, which runs a Java program. `register` creates it lazily.
@@ -368,7 +377,7 @@ All commands below ran in a scratch copy of this repository on 11 November 2026 
 ./gradlew --offline clean check
 ```
 
-   It prints one `PASSED` line per test (98 in all, with `--console=plain`), then `> Task :jacocoTestCoverageVerification`, `> Task :spotlessJavaCheck` and ends with `BUILD SUCCESSFUL in 15s` and `10 actionable tasks: 10 executed`.
+   It prints one `PASSED` line per test (152 in all, with `--console=plain`), then `> Task :jacocoTestCoverageVerification`, `> Task :spotlessJavaCheck` and ends with `BUILD SUCCESSFUL in 8s` and `10 actionable tasks: 10 executed`. That is the captured run of version 1.1.0; the time differs on every run.
 
 3. Collect the jars for the container image:
 
@@ -395,7 +404,7 @@ ls build/stack/lib
 
    Expected: `usage: load <harness.properties>`, then `Execution failed for task ':load'` and `finished with non-zero exit value 2`. Do not give it a real settings file: the harness sends thousands of requests per second to the lab network, which exists only inside the Compose stack.
 
-6. Break the coverage floor on purpose, in a scratch copy only. Change `"0.80"` to `"0.95"` in `build.gradle.kts` and run `./gradlew --offline check -q`. The output contains `Rule violated for bundle seatwave-balancer: lines covered ratio is 0.89, but expected minimum is 0.95` and `Execution failed for task ':jacocoTestCoverageVerification'`, and `BUILD FAILED`.
+6. Break the coverage floor on purpose, in a scratch copy only. Change `"0.80"` to `"0.95"` in `build.gradle.kts` and run `./gradlew --offline check -q`. The output contains `Rule violated for bundle seatwave-balancer: lines covered ratio is 0.93, but expected minimum is 0.95` and `Execution failed for task ':jacocoTestCoverageVerification'`, and `BUILD FAILED`.
 
 ## Mistakes people make
 

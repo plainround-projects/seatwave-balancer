@@ -127,14 +127,14 @@ listen status
 
 ### What the tools do with the running balancer
 
-- **The scripts** read `/stats;csv` through the published status port (21004 for `lb1`, 21014 for `lb2`) and count the rows whose `status` starts with `UP`. See `shell-scripts-walkthrough.md`.
+- **The scripts** read `/stats;csv` through the published status port (21004 for `lb1`, 21014 for `lb2`) and count the rows whose `status` is exactly `UP`. `UP 1/3` and `UP 2/3` do not count: such a server has already failed a check and is on its way down. (Version 1.0.0 counted every status that starts with `UP`.) See `shell-scripts-walkthrough.md`.
 - **The harness** opens the runtime API and reads `show stat` every 100 ms during a run, so it can report the moment a server changed state and how many retries and redispatches the balancer made. See `java-harness-walkthrough-1.md` and `java-harness-walkthrough-2.md`.
 - **The deploy tool** sends `set server <backend>/<server> state drain` to both balancers, watches `scur` until it is 0, and later sets the state back to `ready`. See `java-deploy-walkthrough.md`.
 - **`StackTest`** drains `seatwave-3` in the `seatwave` backend of `lb1`, sends 30 holds, and asserts that only `seatwave-1` and `seatwave-2` answered. See `tests-stack-walkthrough.md`.
 
 ## Try it yourself
 
-I ran these on 11 November 2026 against the running stack (Docker Desktop, project name `seatwave-balancer-notes`; the ports are the real ones). Timings and counts differ on every run. Start the stack with `scripts/stack.sh up --run --yes` first.
+I ran these on 11 November 2026 against the running stack of version 1.0.0 (the old run; Docker Desktop, project name `seatwave-balancer-notes`; the ports are the real ones). Version 1.1.0 changed only comments and one timeout of `haproxy.cfg` (`haproxy-config-walkthrough.md`), so the outputs look the same. Timings and counts differ on every run. Start the stack with `scripts/stack.sh up --run --yes` first.
 
 1. The version, the thread count and the limits, from the runtime API (`nc` is `netcat`, a tool that sends text to a port):
 

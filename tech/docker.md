@@ -18,8 +18,8 @@ Two things are built here, so two Dockerfiles exist. The first turns SeatWave's 
 
 | Path | What it does with Docker |
 |---|---|
-| `Dockerfile` | The recipe for the SeatWave image `seatwave-balancer-seatwave:1.0.0`, in two stages. It runs the three instances and the harness. |
-| `keepalived/Dockerfile` | The recipe for the keepalived image `seatwave-balancer-keepalived:1.0.0`, one stage. |
+| `Dockerfile` | The recipe for the SeatWave image `seatwave-balancer-seatwave:1.1.0`, in two stages. It runs the three instances and the harness. |
+| `keepalived/Dockerfile` | The recipe for the keepalived image `seatwave-balancer-keepalived:1.1.0`, one stage. |
 | `.dockerignore` | Lists what must stay out of the build context (the folder Docker reads when it builds), above all the database password. |
 | `compose.yaml` | Builds both images (`build: .` and `build: ./keepalived`) and runs every container. See `docker-compose.md`. |
 | `scripts/stack.sh` | Runs `docker compose ... up -d --build`, which builds the images. See `shell-scripts-walkthrough.md`. |
@@ -59,7 +59,7 @@ Lines that start with `#` are comments, which Docker ignores. They say that the 
 FROM eclipse-temurin:25.0.5_8-jdk-noble@sha256:95e350ad1eb738f943e141640f7e3d797e483359a3b33c3864255bfd1ad71f8a AS runtime
 COPY build/stack/lib/ /app/lib/
 RUN modules="$(jdeps --print-module-deps --ignore-missing-deps --multi-release 25 \
-        --class-path '/app/lib/*' /app/lib/seatwave-balancer-1.0.0.jar /app/lib/postgresql-42.7.14.jar)" \
+        --class-path '/app/lib/*' /app/lib/seatwave-balancer-1.1.0.jar /app/lib/postgresql-42.7.14.jar)" \
     && echo "linking modules: ${modules}" \
     && jlink --add-modules "${modules}" --strip-debug --no-man-pages --no-header-files \
         --output /opt/seatwave-java
@@ -74,7 +74,7 @@ RUN modules="$(jdeps --print-module-deps --ignore-missing-deps --multi-release 2
   - `--multi-release 25` chooses which version of a "multi-release jar" to read. Some jars hold a different copy of a class for each Java version. 25 is the one this image runs.
   - `--class-path '/app/lib/*'` tells `jdeps` where to find the libraries. The single quotes stop the shell from expanding the `*` itself. The tool understands `*` as "every jar in this folder".
   - The last two words are the jars to analyze: SeatWave's own jar and the PostgreSQL driver. The driver is named separately because nothing in SeatWave's code mentions its classes: SeatWave asks for a `jdbc:postgresql:` address and the driver is found at run time. Without it in the list, the modules that only the driver needs could be missing from the runtime.
-  - The version in the jar's name comes from `version = "1.0.0"` in `build.gradle.kts`, and the driver's version from `gradle/libs.versions.toml`. When either changes, this line must change too.
+  - The version in the jar's name comes from `version = "1.1.0"` in `build.gradle.kts`, and the driver's version from `gradle/libs.versions.toml`. When either changes, this line must change too.
 - The `\` at the end of a line means "the command continues on the next line".
 - `&& echo "linking modules: ${modules}" \` : `&&` means "run the next command only if the one before it succeeded". If `jdeps` fails, the build stops. The `echo` prints the list so you can see it in the build output. The real output on this machine was `linking modules: java.base,java.desktop,java.management,java.naming,java.net.http,java.security.jgss,java.sql,jdk.httpserver`.
 - `&& jlink --add-modules "${modules}" --strip-debug --no-man-pages --no-header-files \` runs `jlink`, the JDK tool that builds a custom runtime.
@@ -84,24 +84,26 @@ RUN modules="$(jdeps --print-module-deps --ignore-missing-deps --multi-release 2
 
 ### Stage 2: the plain operating system and the runtime
 
-`Dockerfile`, lines 16 to 23:
+`Dockerfile`, lines 16 to 25:
 
 ```dockerfile
 # Stage 2: the plain operating system image and the linked runtime, run by a user without a
-# login, a home folder or any rights beyond reading the application.
+# login, a home folder or any rights beyond reading the application. 10001 is above Ubuntu's
+# range of system user ids (up to 999), so it is an ordinary user (as the Module 9 project now
+# writes it); /nonexistent is Debian's name for "no home folder", which it really does not have.
 FROM ubuntu:noble@sha256:fe81560990fae86dc4743202b2cb4d3df98d0bcf949173cecef15ce1127ef852
-RUN useradd --system --uid 10001 --no-create-home --shell /usr/sbin/nologin seatwave
+RUN useradd --uid 10001 --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin seatwave
 COPY --from=runtime /opt/seatwave-java /opt/seatwave-java
 COPY --from=runtime /app/lib/ /app/lib/
 COPY config/ /app/config/
 USER 10001
 ```
-- The two comment lines say that the final image is the plain operating system image plus the linked runtime, run by a user "without a login, a home folder or any rights beyond reading the application".
+- The four comment lines say that the final image is the plain operating system image plus the linked runtime, run by a user "without a login, a home folder or any rights beyond reading the application". They also explain the two choices on the `useradd` line below: why 10001 makes an ordinary user, and why the home folder is named `/nonexistent`. The Module 9 project (seatwave-proxy) writes the same line since its own review.
 - `FROM ubuntu:noble@sha256:fe8156...` starts stage 2 with Ubuntu 24.04 and no Java. Nothing from stage 1 is here yet.
-- `RUN useradd --system --uid 10001 --no-create-home --shell /usr/sbin/nologin seatwave` creates an operating-system user named `seatwave`.
+- `RUN useradd --uid 10001 --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin seatwave` creates an operating-system user named `seatwave`.
   - `--uid 10001` fixes the numeric user id. A high number collides with no real account.
-  - `--system` marks it as a system account (the kind used by services). Ubuntu keeps the numbers up to 999 for system accounts, and 10001 is above that range, so the tool prints a warning on every build: `useradd warning: seatwave's uid 10001 is greater than SYS_UID_MAX 999`. I saw that line in the build output. It is harmless. `--system` also gave the user's group the number 999, not 10001: `id` in the container prints `uid=10001(seatwave) gid=999(seatwave) groups=999(seatwave)`.
-  - `--no-create-home` does not create a home folder. The user's line in `/etc/passwd` still names `/home/seatwave`, a folder that does not exist (`grep seatwave /etc/passwd` printed `seatwave:x:10001:999::/home/seatwave:/usr/sbin/nologin`).
+  - There is no `--system` flag. Ubuntu keeps the user ids up to 999 for **system accounts** (the kind that packages create for services). 10001 is above that range, so it is an **ordinary user**. Version 1.0.0 of this file asked for a system account with this high number, and `useradd` printed a warning on every build (`useradd warning: seatwave's uid 10001 is greater than SYS_UID_MAX 999`) and gave the user's group the system number 999. Without `--system`, `useradd` makes a group of the same name and, when that number is free, gives it the same number as the user. In the Module 9 project's rebuilt image, made with this same line on the same `ubuntu:noble` digest, `id` printed `uid=10001(seatwave) gid=10001(seatwave) groups=10001(seatwave)`. I did not rebuild this repository's image, so that line is the Module 9 project's measurement.
+  - `--no-create-home` does not create a home folder, and `--home-dir /nonexistent` writes that fact into `/etc/passwd`, the file that lists the users. `/nonexistent` is the name Debian and Ubuntu use for "this user has no home folder"; the folder really does not exist. Version 1.0.0 named `/home/seatwave` there, a folder that was never made.
   - `--shell /usr/sbin/nologin` means nobody can log in as this user.
 - `COPY --from=runtime /opt/seatwave-java /opt/seatwave-java` takes the linked runtime from stage 1 (named `runtime` on the `FROM` line there), not from the build context. This is how the runtime arrives without the JDK. The next line copies the jars from stage 1 the same way.
 - `COPY config/ /app/config/` copies the folder `config/` from the build context: the settings files. The container uses `config/seatwave-container.properties` for a SeatWave instance (see `java-properties.md`) and the harness reads the lab files from the same folder.
@@ -109,7 +111,7 @@ USER 10001
 
 ### How the program starts
 
-`Dockerfile`, lines 24 to 28:
+`Dockerfile`, lines 26 to 30:
 
 ```dockerfile
 # The exec form makes Java process 1, so docker stop's SIGTERM reaches it and its shutdown hook
@@ -172,7 +174,7 @@ I checked the result in the running instance: `ls /app` printed `config` and `li
 
 ## Try it yourself
 
-I ran these in a copy of the repository on 11 November 2026 with Docker 24.0.6 and Compose v2.23.0-desktop.1. I used the Compose project name `seatwave-balancer-notes` and renamed the image tags in my copy (`seatwave-balancer-notes-seatwave:1.0.0`, `seatwave-balancer-notes-keepalived:1.0.0`) so that I would not touch the images of the real project; with the repository as it is, use `seatwave-balancer-seatwave:1.0.0` and `seatwave-balancer-keepalived:1.0.0` and leave `-p` out. Timings and sizes differ on every machine. The stack was already up (`scripts/stack.sh up --run --yes`).
+I ran these in a copy of the repository on 11 November 2026 with Docker 24.0.6 and Compose v2.23.0-desktop.1, at version 1.0.0 of the repository (the old run). I used the Compose project name `seatwave-balancer-notes` and renamed the image tags in my copy (`seatwave-balancer-notes-seatwave:1.0.0`, `seatwave-balancer-notes-keepalived:1.0.0`) so that I would not touch the images of the real project. With the repository as it is now, version 1.1.0, use `seatwave-balancer-seatwave:1.1.0` and `seatwave-balancer-keepalived:1.1.0` and leave `-p` out. Three things in the outputs below belong to version 1.0.0 and look different now: the tag in the image names is `1.1.0`; the `useradd warning` line no longer appears, because the user is no longer a system account (the history row shows the new `useradd` line); and `id` prints the group 10001 instead of 999, as the Stage 2 walkthrough above explains. The re-measured run of version 1.1.0 found the same image size, 203 MB. Timings and sizes differ on every machine. The stack was already up (`scripts/stack.sh up --run --yes`).
 
 1. Collect the jars, then rebuild the SeatWave image without the cache and show the interesting lines:
 

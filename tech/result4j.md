@@ -108,20 +108,27 @@ The first two lines come from the two `switch` statements: the good value, then 
     int port = reader.intBetween("http.port", 0, HIGHEST_PORT);
     int adminPort = reader.intBetween("http.adminPort", 0, HIGHEST_PORT);
     int backlog = reader.intBetween("http.backlog", 1, MAX_BACKLOG);
+    int problemsBeforeWorkers = reader.problems().size();
     int workers = reader.intBetween("http.workerThreads", 1, MAX_WORKERS);
+    boolean workersRead = reader.problems().size() == problemsBeforeWorkers;
     int queue = reader.intBetween("http.queueCapacity", 1, MAX_QUEUE);
     String url = reader.textMatching("db.url", JDBC_URL);
     String user = reader.textMatching("db.user", USER);
-    String passwordFile = reader.textMatching("db.passwordFile", FILE);
+    String passwordFile = reader.filePath("db.passwordFile");
+    int problemsBeforePool = reader.problems().size();
     int poolSize = reader.intBetween("db.poolSize", 1, MAX_POOL);
-    Duration connect = reader.millisBetween("db.connectTimeoutMillis", 1, MAX_WAIT_MILLIS);
+    boolean poolRead = reader.problems().size() == problemsBeforePool;
+    Duration connect =
+        reader.millisBetween("db.connectTimeoutMillis", MIN_CONNECT_MILLIS, MAX_WAIT_MILLIS);
     Duration check =
         reader.millisBetween("readiness.checkTimeoutMillis", MIN_CHECK_MILLIS, MAX_WAIT_MILLIS);
     Duration drain = reader.millisBetween("drain.deadlineMillis", 0, MAX_WAIT_MILLIS);
     if (port != 0 && port == adminPort) {
       reader.addProblem("http.port and http.adminPort must differ (0 means any free port)");
     }
-    if (poolSize > workers) {
+    // A rule between two keys is checked only when both were read, so a missing key gives one
+    // problem line, not a second one about the stand-in value.
+    if (workersRead && poolRead && poolSize > workers) {
       reader.addProblem(
           "db.poolSize must not be larger than http.workerThreads: a connection no worker can use"
               + " is held open at the database for nothing");
@@ -143,7 +150,7 @@ The first two lines come from the two `switch` statements: the good value, then 
   }
 ```
 
-The result type here is `Result<ServiceSettings, List<String>>`. The method reads every key through the `SettingsReader`, which never stops: a bad key adds a problem line and returns a harmless stand-in value (the minimum of the range, or an empty text). After all keys, and after the two rules that link keys (the two ports must differ, and the pool cannot be larger than the worker count), the method looks at the problem list. If it is not empty, `Result.error(reader.problems())` returns the lines. Otherwise `Result.success(...)` returns the finished record. The stand-in values are harmless because the record is never built from them. `HarnessSettings.from` and `DeploySettings.from` have the same shape, each with its own `if (!reader.problems().isEmpty() || balancers.isEmpty())` test before the last `return Result.success(`.
+The result type here is `Result<ServiceSettings, List<String>>`. The method reads every key through the `SettingsReader`, which never stops: a bad key adds a problem line and returns a harmless stand-in value (the minimum of the range, or an empty text). After all keys, and after the two rules that link keys (the two ports must differ, and the pool cannot be larger than the worker count), the method looks at the problem list. The pool rule runs only when both of its keys were read: `workersRead` and `poolRead` compare the number of problems before and after each read, so a missing key gives one problem line and not a second one about its stand-in value. If it is not empty, `Result.error(reader.problems())` returns the lines. Otherwise `Result.success(...)` returns the finished record. The stand-in values are harmless because the record is never built from them. `HarnessSettings.from` and `DeploySettings.from` have the same shape, each with its own `if (!reader.problems().isEmpty() || balancers.isEmpty())` test before the last `return Result.success(`.
 
 ### Building a result from one reason: `NamedBalancer.parse`
 
@@ -164,6 +171,12 @@ The result type here is `Result<ServiceSettings, List<String>>`. The method read
       } catch (IllegalArgumentException notAnAddress) {
         return Result.error("'" + entry + "' does not hold an IP address");
       }
+      // ofLiteral also reads short and padded forms (127.0.1, 010.0.0.1); only the dotted form
+      // that prints back the same is the address the reader meant.
+      if (!address.getHostAddress().equals(matcher.group(2))) {
+        return Result.error(
+            "'" + entry + "' does not hold a dotted IPv4 address with four parts and no padding");
+      }
       balancers.add(
           new NamedBalancer(
               matcher.group(1),
@@ -174,7 +187,7 @@ The result type here is `Result<ServiceSettings, List<String>>`. The method read
   }
 ```
 
-Here the error type is a single `String`: the first entry that is wrong, with the reason. The method returns at the first wrong entry, because the settings classes add it to their problem list as one line (`reader.addProblem("watch.balancers: " + reason)`). A success holds an immutable copy of the list, made with `List.copyOf`.
+Here the error type is a single `String`: the first entry that is wrong, with the reason. There are three reasons: the entry does not have the shape `name=address:port` (or its port is over 65,535), the address is not an IP address at all, or it is one that `InetAddress.ofLiteral` reads but writes back differently. The comment explains the third: `ofLiteral` also accepts short and padded forms such as `127.0.1` and `010.0.0.1`, so the code compares `getHostAddress()` with the text and accepts only the dotted form with four parts that prints back the same. The method returns at the first wrong entry, because the settings classes add it to their problem list as one line (`reader.addProblem("watch.balancers: " + reason)`). A success holds an immutable copy of the list, made with `List.copyOf`.
 
 ### A result whose error is a sealed type: `JdbcHoldStore`
 
@@ -224,7 +237,7 @@ Here the error is not text but a value of the sealed interface `HoldRefusal` (`j
       say(instance + ": started");
       setEverywhere(instance, AdminState.READY);
       say(instance + ": ready set; the checks decide when it gets traffic again");
-      if (!waitFor(instance, StatRow::isUp, settings.upTimeout())) {
+      if (!waitFor(instance, StatRow::isFullyUp, settings.upTimeout())) {
         return Result.error(instance + " did not pass its checks within " + settings.upTimeout());
       }
       say(instance + ": up on every balancer; slow start ramps its weight");
@@ -235,7 +248,7 @@ Here the error is not text but a value of the sealed interface `HoldRefusal` (`j
     }
 ```
 
-`restart` runs one instance's whole sequence: drain, wait, stop, wait until seen down, start, ready, wait until up, settle. Every step that can time out returns `Result.error(...)` with a sentence that names the instance and the limit, and the last line of the `try` returns `Result.success(1)`. `run` (lines 54 to 69 of the file) calls `restart` once per instance and returns the first error it meets, so a failed deploy stops at the instance that failed and leaves it drained or stopped, never sent traffic it cannot serve. An `IOException` from the Docker call is turned into an error too, so the caller has one kind of failure to handle.
+`restart` runs one instance's whole sequence: drain, wait, stop, wait until seen down, start, ready, wait until up, settle. Every step that can time out returns `Result.error(...)` with a sentence that names the instance and the limit (the last wait asks for `StatRow::isFullyUp`, a status of exactly `UP`, so an instance still counting failed checks is not taken as back), and the last line of the `try` returns `Result.success(1)`. `run` (lines 54 to 69 of the file) calls `restart` once per instance and returns the first error it meets, so a failed deploy stops at the instance that failed and leaves it drained or stopped, never sent traffic it cannot serve. An `IOException` from the Docker call is turned into an error too, so the caller has one kind of failure to handle.
 
 ### Examining a result: `switch` with record patterns
 
@@ -259,11 +272,17 @@ This `switch` is an **expression**: it produces the value that `return` hands ba
           checked(request, parsed);
       case Result.Error<HoldRequestBody, JsonCodec.BindingProblem>(
               JsonCodec.BindingProblem problem) ->
-          invalid(request, List.of(problem.pointer() + " " + problem.detail()));
+          // A whole-body problem has the empty pointer (RFC 6901), so its detail stands alone.
+          invalid(
+              request,
+              List.of(
+                  problem.pointer().isEmpty()
+                      ? problem.detail()
+                      : problem.pointer() + " " + problem.detail()));
     };
 ```
 
-The same idea in the route: a success goes on to check the fields, and an error becomes an invalid-request answer that joins the field's JSON pointer and the detail, such as `/eventId has the wrong type`.
+The same idea in the route: a success goes on to check the fields, and an error becomes an invalid-request answer that joins the field's JSON pointer and the detail, such as `/eventId has the wrong type`. A problem with the whole body has the empty pointer, so its detail stands alone (`the body has data after the JSON object`); the `? :` inside `List.of(...)` makes that choice.
 
 ```java
   private Reply answer(Request request, Result<GrantedHold, HoldRefusal> outcome) {
@@ -289,14 +308,19 @@ The store's result is examined in the same way. A success logs the business even
 ```java
   private void remember(String body) {
     if (json.read(body, HoldReply.class)
-        instanceof Result.Success<HoldReply, JsonCodec.BindingProblem>(HoldReply hold)) {
+            instanceof Result.Success<HoldReply, JsonCodec.BindingProblem>(HoldReply hold)
+        && hold.holdId() != null
+        && HOLD_ID.matcher(hold.holdId()).matches()) {
       long slot = holdsMade.getAndIncrement();
       recentHolds.set((int) Math.floorMod(slot, (long) RECENT_HOLDS), hold.holdId());
+      return;
     }
-  }
+    // A 201 whose body this harness cannot read (a field it does not know, a hold id that is not a
+    // UUID) is still an answer to the fan, but no read can follow it; the report counts these.
+    unreadableReplies.incrementAndGet();
 ```
 
-`instanceof` accepts a record pattern too. If the result of reading the body is a `Success`, the pattern binds its hold to the name `hold` for the lines inside the `if`. For an error nothing happens, because the load run does not need to know why a body could not be read.
+`instanceof` accepts a record pattern too. If the result of reading the body is a `Success`, the pattern binds its hold to the name `hold`, and the name can be used in the rest of the condition: `&&` goes on only while each part is true, so `hold.holdId() != null` and the `HOLD_ID` pattern (a UUID) are checked on the hold just bound. When all three hold, the id is kept for a later read and `return` ends the method. Otherwise the last line counts the reply in `unreadableReplies`. The comment says why it is counted and not ignored: a `201` whose body the harness cannot read is still an answer to the fan, but no read can follow it, and the report shows how many there were.
 
 ```java
     for (String instance : settings.instances()) {
