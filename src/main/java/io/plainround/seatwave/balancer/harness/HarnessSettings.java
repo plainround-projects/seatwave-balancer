@@ -3,11 +3,13 @@ package io.plainround.seatwave.balancer.harness;
 import com.github.sviperll.result4j.Result;
 import io.plainround.seatwave.balancer.config.SettingsReader;
 import io.plainround.seatwave.balancer.haproxy.NamedBalancer;
+import java.net.InetAddress;
 import java.net.URI;
 import java.time.Duration;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 /**
@@ -49,8 +51,10 @@ public record HarnessSettings(
     Duration timelineStep) {
 
   private static final Pattern LABEL = Pattern.compile("[a-z0-9-]{1,32}");
-  // Only plain HTTP to an address literal of the lab network or this machine.
-  private static final Pattern TARGET = Pattern.compile("http://[0-9.]{7,15}:[0-9]{1,5}");
+  // Only plain HTTP to a dotted IPv4 literal of the lab network or this machine, with a port from 1
+  // to 65,535 written without a leading zero; the address is checked again once it is parsed.
+  private static final Pattern TARGET = Pattern.compile("http://([0-9.]{7,15}):([1-9][0-9]{0,4})");
+  private static final int HIGHEST_PORT = 65_535;
   private static final Pattern NAME = Pattern.compile("[A-Za-z0-9_-]{1,64}");
   private static final Pattern ENTRY = Pattern.compile("[a-z0-9=.:-]{1,64}");
   private static final String NO_VICTIM = "none";
@@ -93,8 +97,12 @@ public record HarnessSettings(
     Duration duration = reader.millisBetween("load.durationMillis", 1, MAX_DURATION_MILLIS);
     int holdPercent = reader.intBetween("load.holdPercent", 0, PERCENT);
     int maxInFlight = reader.intBetween("load.maxInFlight", 1, MAX_IN_FLIGHT);
+    int problemsBeforeTimeouts = reader.problems().size();
     Duration connect = reader.millisBetween("load.connectTimeoutMillis", 1, MAX_TIMEOUT_MILLIS);
     Duration request = reader.millisBetween("load.requestTimeoutMillis", 1, MAX_TIMEOUT_MILLIS);
+    // The rule between the two keys is checked only when both were read, so a missing key gives
+    // one problem line, not a second one about the stand-in values.
+    boolean timeoutsRead = reader.problems().size() == problemsBeforeTimeouts;
     int seed = reader.intBetween("load.seed", 0, MAX_SEED);
     List<String> entries = reader.listMatching("watch.balancers", ENTRY);
     String backend = reader.textMatching("watch.backend", NAME);
@@ -102,7 +110,13 @@ public record HarnessSettings(
         reader.millisBetween("watch.intervalMillis", MIN_WATCH_MILLIS, MAX_TIMEOUT_MILLIS);
     String victim = reader.textMatching("report.victim", NAME);
     Duration step = reader.millisBetween("report.timelineMillis", 1, MAX_DURATION_MILLIS);
-    if (request.compareTo(connect) <= 0) {
+    if (!target.isEmpty() && !isExactTarget(target)) {
+      reader.addProblem(
+          "target.url must be http:// with a dotted IPv4 address and a port from 1 to 65535, such"
+              + " as http://10.210.10.21:8080, but was "
+              + target);
+    }
+    if (timeoutsRead && request.compareTo(connect) <= 0) {
       reader.addProblem(
           "load.requestTimeoutMillis must be longer than load.connectTimeoutMillis, or no request"
               + " that needs a new connection can finish");
@@ -136,6 +150,20 @@ public record HarnessSettings(
             watch,
             victim.equals(NO_VICTIM) ? "" : victim,
             step));
+  }
+
+  private static boolean isExactTarget(String target) {
+    Matcher parts = TARGET.matcher(target);
+    if (!parts.matches() || Integer.parseInt(parts.group(2)) > HIGHEST_PORT) {
+      return false;
+    }
+    // ofLiteral also reads short forms such as 127.1; only the form that prints back the same is
+    // the address the reader meant.
+    try {
+      return InetAddress.ofLiteral(parts.group(1)).getHostAddress().equals(parts.group(1));
+    } catch (IllegalArgumentException notAnAddress) {
+      return false;
+    }
   }
 
   /**

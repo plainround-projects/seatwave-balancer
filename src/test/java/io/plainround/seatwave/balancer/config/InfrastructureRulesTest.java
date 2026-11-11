@@ -19,6 +19,12 @@ import org.junit.jupiter.api.Test;
 class InfrastructureRulesTest {
 
   private static final Pattern PUBLISHED = Pattern.compile("- \"([0-9.]+):([0-9]+):([0-9]+)\"");
+  // FROM name:tag@sha256:<64 hex digits>, with an optional stage name.
+  private static final Pattern PINNED_FROM =
+      Pattern.compile("FROM [a-z0-9./-]+:[A-Za-z0-9._-]+@sha256:[0-9a-f]{64}( AS [a-z]+)?");
+  // An image: line (not one that refers to an anchor), or the anchor that names the balancers'.
+  private static final Pattern IMAGE =
+      Pattern.compile("(?m)^ *(?:image:|x-haproxy-image: &haproxy-image) ([^*\\s]\\S*)$");
   private static final int FIRST_PORT = 21000;
   private static final int LAST_PORT = 21099;
 
@@ -34,7 +40,7 @@ class InfrastructureRulesTest {
   }
 
   @Test
-  void retriesOnlyWhatSeatWaveDidNotServe() throws IOException {
+  void retriesOnlyWhatIsSafeToRepeat() throws IOException {
     String production = backend("seatwave");
 
     assertThat(production).contains("\n  retry-on conn-failure empty-response 503\n");
@@ -87,17 +93,46 @@ class InfrastructureRulesTest {
   @Test
   void pinsEveryImageByTagAndDigest() throws IOException {
     String compose = Files.readString(Path.of("compose.yaml"), StandardCharsets.UTF_8);
-    String dockerfile = Files.readString(Path.of("Dockerfile"), StandardCharsets.UTF_8);
-    String keepalived = Files.readString(Path.of("keepalived/Dockerfile"), StandardCharsets.UTF_8);
 
-    assertThat(compose).contains("haproxy:3.4.7@sha256:").contains("postgres:18.6@sha256:");
-    assertThat(dockerfile)
-        .containsPattern("FROM eclipse-temurin:25\\.0\\.5_8-jdk-noble@sha256:[0-9a-f]{64}");
-    assertThat(keepalived).containsPattern("FROM alpine:3\\.24\\.4@sha256:[0-9a-f]{64}");
+    // Every FROM line of both Dockerfiles, the second stage's included.
+    assertThat(fromLines("Dockerfile"))
+        .hasSize(2)
+        .allMatch(line -> PINNED_FROM.matcher(line).matches(), "pinned by tag and digest");
+    assertThat(fromLines("keepalived/Dockerfile"))
+        .hasSize(1)
+        .allMatch(line -> PINNED_FROM.matcher(line).matches(), "pinned by tag and digest");
+    // Every image compose.yaml pulls; the ones this project builds itself carry its own name.
+    Matcher image = IMAGE.matcher(compose);
+    int pulled = 0;
+    while (image.find()) {
+      String name = image.group(1);
+      if (!name.startsWith("seatwave-balancer-")) {
+        pulled++;
+        assertThat(name).matches("[a-z0-9./-]+:[A-Za-z0-9._-]+@sha256:[0-9a-f]{64}");
+      }
+    }
+    assertThat(pulled).isEqualTo(2);
     assertThat(compose)
         .doesNotContain("privileged: true")
         .doesNotContain("network_mode: host")
         .doesNotContain("docker.sock");
+  }
+
+  @Test
+  void limitsHowLongAClientMaySendItsRequestHead() throws IOException {
+    String config =
+        Files.readString(Path.of(System.getProperty("seatwave.haproxy")), StandardCharsets.UTF_8);
+    String defaults =
+        config.substring(config.indexOf("\ndefaults\n"), config.indexOf("\nfrontend "));
+
+    // In the defaults, so every frontend has it, and shorter than the 30 s client timeout.
+    assertThat(defaults).containsPattern("\n  timeout http-request 5s\n");
+  }
+
+  private static List<String> fromLines(String dockerfile) throws IOException {
+    return Files.readAllLines(Path.of(dockerfile), StandardCharsets.UTF_8).stream()
+        .filter(line -> line.startsWith("FROM "))
+        .toList();
   }
 
   private static String backend(String name) throws IOException {

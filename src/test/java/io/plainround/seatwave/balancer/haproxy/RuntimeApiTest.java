@@ -49,7 +49,7 @@ class RuntimeApiTest {
     assertThatThrownBy(
             () -> RuntimeCommand.setState("seatwave\nshow", "s1", RuntimeCommand.AdminState.MAINT))
         .isInstanceOf(IllegalArgumentException.class)
-        .hasMessageContaining("backend");
+        .hasMessage("backend must match [A-Za-z0-9_-]{1,64}, but was \"seatwave\\u000ashow\"");
   }
 
   @Test
@@ -75,5 +75,22 @@ class RuntimeApiTest {
                 "'lb1=10.210.10.21:99999' is not name=address:port, such as lb1=10.210.10.21:9999"));
     assertThat(notAddress)
         .isEqualTo(Result.error("'lb1=999.210.10.21:9999' does not hold an IP address"));
+  }
+
+  @Test
+  void refusesTheShortAndPaddedFormsOfAnEntry() {
+    String shortForm = "lb1=127.0.1:9999";
+    String paddedPort = "lb1=127.0.0.1:09999";
+    String portZero = "lb1=127.0.0.1:0";
+
+    assertThat(NamedBalancer.parse(List.of(shortForm), Duration.ofSeconds(1)))
+        .isEqualTo(
+            Result.error(
+                "'lb1=127.0.1:9999' does not hold a dotted IPv4 address with four parts and no"
+                    + " padding"));
+    assertThat(NamedBalancer.parse(List.of(paddedPort), Duration.ofSeconds(1)))
+        .isInstanceOf(Result.Error.class);
+    assertThat(NamedBalancer.parse(List.of(portZero), Duration.ofSeconds(1)))
+        .isInstanceOf(Result.Error.class);
   }
 }

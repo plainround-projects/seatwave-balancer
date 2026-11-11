@@ -1,7 +1,6 @@
 package io.plainround.seatwave.balancer.haproxy;
 
 import java.util.Map;
-import java.util.Objects;
 
 /**
  * One row of {@code show stat}, read by the column names HAProxy's management guide lists. A
@@ -54,6 +53,15 @@ public record StatRow(Map<String, String> values) {
   }
 
   /**
+   * Says whether the server is up and passing its checks, with no failed check counted against it.
+   *
+   * @return true for exactly UP; false for "UP 1/3" and "UP 2/3", which are falling
+   */
+  public boolean isFullyUp() {
+    return status().equals("UP");
+  }
+
+  /**
    * Returns the current sessions, the requests the server is working on now ({@code scur}).
    *
    * @return the count
@@ -99,6 +107,15 @@ public record StatRow(Map<String, String> values) {
   }
 
   /**
+   * Returns the seconds since the server's status last changed ({@code lastchg}).
+   *
+   * @return the seconds, or zero for a row without a status
+   */
+  public long secondsSinceChange() {
+    return number("lastchg");
+  }
+
+  /**
    * Returns the server's current weight ({@code weight}), which slow start raises step by step.
    *
    * @return the weight
@@ -120,8 +137,7 @@ public record StatRow(Map<String, String> values) {
       return Long.parseLong(cell);
     } catch (NumberFormatException notANumber) {
       throw new IllegalStateException(
-          "the show stat column " + column + " is not a number: " + Objects.toString(cell),
-          notANumber);
+          "the show stat column " + column + " is not a number: " + cell, notANumber);
     }
   }
 }

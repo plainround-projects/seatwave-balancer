@@ -89,7 +89,7 @@ final class RollingDeploy {
       say(instance + ": started");
       setEverywhere(instance, AdminState.READY);
       say(instance + ": ready set; the checks decide when it gets traffic again");
-      if (!waitFor(instance, StatRow::isUp, settings.upTimeout())) {
+      if (!waitFor(instance, StatRow::isFullyUp, settings.upTimeout())) {
         return Result.error(instance + " did not pass its checks within " + settings.upTimeout());
       }
       say(instance + ": up on every balancer; slow start ramps its weight");
@@ -150,7 +150,8 @@ final class RollingDeploy {
           if (row.isEmpty()) {
             return Optional.of(balancer.name() + " has no server " + backend + "/" + instance);
           }
-          if (!row.get().isUp()) {
+          // Fully up: "UP 1/3" is an instance already failing its checks, not one to deploy over.
+          if (!row.get().isFullyUp()) {
             return Optional.of(
                 balancer.name() + " sees " + backend + "/" + instance + " " + row.get().status());
           }

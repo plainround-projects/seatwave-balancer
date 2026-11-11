@@ -13,6 +13,9 @@ import java.util.concurrent.atomic.LongAdder;
  * by route and status, a duration histogram, requests refused because the instance was not ready,
  * requests refused by a full queue, and the lifecycle's state and in-flight count.
  *
+ * <p>Every line ends in {@code \n}, never the platform's line separator: the text format is the
+ * same on every machine.
+ *
  * <p>The labels are the route template and the status, never a raw path or a client address, so the
  * number of series stays small (the guidelines' rule 68). Thread-safe: every field is a concurrent
  * counter.
@@ -73,7 +76,7 @@ final class ServiceMetrics {
       text.append(
           String.format(
               Locale.ROOT,
-              "seatwave_requests_total{route=\"%s\",status=\"%s\"} %d%n",
+              "seatwave_requests_total{route=\"%s\",status=\"%s\"} %d\n",
               key.substring(0, bar),
               key.substring(bar + 1),
               count));
@@ -83,19 +86,19 @@ final class ServiceMetrics {
       text.append(
           String.format(
               Locale.ROOT,
-              "seatwave_request_seconds_bucket{le=\"%s\"} %d%n",
+              "seatwave_request_seconds_bucket{le=\"%s\"} %d\n",
               BUCKET_SECONDS.get(bucketIndex),
               bucketCounts[bucketIndex].sum()));
     }
     long count = durationCount.sum();
     text.append(
-        String.format(Locale.ROOT, "seatwave_request_seconds_bucket{le=\"+Inf\"} %d%n", count));
+        String.format(Locale.ROOT, "seatwave_request_seconds_bucket{le=\"+Inf\"} %d\n", count));
     text.append(
         String.format(
             Locale.ROOT,
-            "seatwave_request_seconds_sum %.6f%n",
+            "seatwave_request_seconds_sum %.6f\n",
             durationNanos.sum() / NANOS_PER_SECOND));
-    text.append(String.format(Locale.ROOT, "seatwave_request_seconds_count %d%n", count));
+    text.append(String.format(Locale.ROOT, "seatwave_request_seconds_count %d\n", count));
     line(text, "counter", "seatwave_not_admitted_total", notAdmitted.sum());
     line(text, "counter", "seatwave_rejected_queue_full_total", rejectedByQueue.sum());
     line(text, "gauge", "seatwave_in_flight", lifecycle.inFlight());
@@ -105,7 +108,7 @@ final class ServiceMetrics {
       text.append(
           String.format(
               Locale.ROOT,
-              "seatwave_state{state=\"%s\"} %d%n",
+              "seatwave_state{state=\"%s\"} %d\n",
               state.name().toLowerCase(Locale.ROOT),
               state == current ? 1 : 0));
     }

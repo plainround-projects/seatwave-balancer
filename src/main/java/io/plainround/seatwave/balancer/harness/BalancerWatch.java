@@ -108,9 +108,11 @@ final class BalancerWatch implements Runnable {
   }
 
   private void readOnce() {
-    long atNanos = System.nanoTime() - startNanos;
     try {
       StatTable table = balancer.api().showStat();
+      // Stamped when the answer arrived: a status read then was true at that moment, while the
+      // moment the question was sent can be up to one read earlier than the change.
+      long atNanos = System.nanoTime() - startNanos;
       if (firstAndLast.size() < 2) {
         firstAndLast.add(table);
       } else {
@@ -121,8 +123,9 @@ final class BalancerWatch implements Runnable {
         record(atNanos, balancer.name(), row.server(), row.status());
       }
     } catch (IOException silent) {
-      // A balancer that does not answer is exactly what the pair lab kills; it is a status here.
-      record(atNanos, balancer.name(), ANY_SERVER, UNREACHABLE);
+      // A balancer that does not answer is exactly what the pair lab kills; it is a status here,
+      // stamped when the read gave up.
+      record(System.nanoTime() - startNanos, balancer.name(), ANY_SERVER, UNREACHABLE);
     }
   }
 

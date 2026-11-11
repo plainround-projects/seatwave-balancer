@@ -6,6 +6,7 @@ import io.plainround.seatwave.balancer.haproxy.FakeBalancer;
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.io.OutputStream;
 import java.io.PrintStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -14,6 +15,7 @@ import java.time.Clock;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.util.List;
+import java.util.Properties;
 import java.util.concurrent.CopyOnWriteArrayList;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -31,6 +33,7 @@ class DeployCliTest {
   private final List<String> containerCalls = new CopyOnWriteArrayList<>();
   // What the fake balancer reports for seatwave-1; the fake containers change it.
   private String[] containerStatus = {"UP"};
+  private Runnable onStop = () -> {};
 
   @Test
   void printsThePlanAndChangesNothingByDefault() throws IOException {
@@ -78,6 +81,57 @@ class DeployCliTest {
   }
 
   @Test
+  void deploysWithoutAQuestionWhenGivenYes() throws IOException {
+    String[] status = {"UP"};
+    try (FakeBalancer balancer = deployingBalancer(status)) {
+      containerStatus = status;
+
+      int code = run(settings(balancer, folder.resolve("audit.log")), "", "--run", "--yes");
+
+      assertThat(code).isZero();
+      assertThat(text(out)).doesNotContain("Go ahead?").contains("deploy finished: 1 instances");
+      assertThat(containerCalls).containsExactly("stop seatwave-1", "start seatwave-1");
+    }
+  }
+
+  @Test
+  void saysTheDeployFinishedWhenOnlyTheLastAuditLineFails() throws IOException {
+    String[] status = {"UP"};
+    Path audit = folder.resolve("audit.log");
+    try (FakeBalancer balancer = deployingBalancer(status)) {
+      containerStatus = status;
+      // The audit file turns read-only after the first line, while the instance restarts.
+      onStop = () -> audit.toFile().setReadOnly();
+
+      int code = run(settings(balancer, audit), "", "--run", "--yes");
+
+      assertThat(code).isEqualTo(DeployCli.EXIT_FAILED);
+      assertThat(text(out)).contains("deploy finished: 1 instances restarted, all up");
+      assertThat(text(err))
+          .contains("the audit line of this deploy cannot be written")
+          .contains("the deploy itself finished as printed above")
+          .doesNotContain("deploy stopped");
+    }
+  }
+
+  @Test
+  void startsNothingWhenTheFirstAuditLineCannotBeWritten() throws IOException {
+    String[] status = {"UP"};
+    // A folder where the audit file should be: no line can be appended to it.
+    Path audit = Files.createDirectories(folder.resolve("audit-folder.log"));
+    try (FakeBalancer balancer = deployingBalancer(status)) {
+      containerStatus = status;
+
+      int code = run(settings(balancer, audit), "", "--run", "--yes");
+
+      assertThat(code).isEqualTo(DeployCli.EXIT_FAILED);
+      assertThat(text(err)).contains("deploy not started", "nothing changed");
+      assertThat(containerCalls).isEmpty();
+      assertThat(balancer.commands()).isEmpty();
+    }
+  }
+
+  @Test
   void refusesBadUsage() {
     assertThat(run(Path.of("x"), "", "--now")).isEqualTo(DeployCli.EXIT_BAD_USAGE);
     assertThat(text(err)).contains("usage: deploy");
@@ -98,6 +152,7 @@ class DeployCliTest {
               @Override
               public void stop(String service) {
                 containerCalls.add("stop " + service);
+                onStop.run();
                 containerStatus[0] = "DOWN";
               }
 
@@ -110,22 +165,34 @@ class DeployCliTest {
   }
 
   private Path settings(FakeBalancer balancer) throws IOException {
-    return Files.writeString(
-        folder.resolve("deploy.properties"),
-        String.join(
-            "\n",
-            "compose.project=seatwave-balancer",
-            "deploy.instances=seatwave-1",
-            "deploy.backends=seatwave",
-            "deploy.balancers=lb1=127.0.0.1:" + balancer.port(),
-            "deploy.drainTimeoutMillis=1000",
-            "deploy.stopTimeoutMillis=1000",
-            "deploy.upTimeoutMillis=1000",
-            "deploy.settleMillis=0",
-            "deploy.pollMillis=10",
-            "deploy.auditFile=" + folder.resolve("audit.log"),
-            ""),
-        StandardCharsets.UTF_8);
+    return settings(balancer, folder.resolve("audit.log"));
+  }
+
+  private Path settings(FakeBalancer balancer, Path audit) throws IOException {
+    Properties properties = new Properties();
+    properties.setProperty("compose.project", "seatwave-balancer");
+    properties.setProperty("deploy.instances", "seatwave-1");
+    properties.setProperty("deploy.backends", "seatwave");
+    properties.setProperty("deploy.balancers", "lb1=127.0.0.1:" + balancer.port());
+    properties.setProperty("deploy.drainTimeoutMillis", "1000");
+    properties.setProperty("deploy.stopTimeoutMillis", "1000");
+    properties.setProperty("deploy.upTimeoutMillis", "1000");
+    properties.setProperty("deploy.settleMillis", "0");
+    properties.setProperty("deploy.pollMillis", "10");
+    // Written by Properties.store, which escapes a backslash, so a Windows path reads back whole.
+    properties.setProperty("deploy.auditFile", audit.toString());
+    Path file = folder.resolve("deploy.properties");
+    try (OutputStream stream = Files.newOutputStream(file)) {
+      properties.store(stream, "test");
+    }
+    return file;
+  }
+
+  private static FakeBalancer deployingBalancer(String[] status) throws IOException {
+    return new FakeBalancer(command ->
+        command.startsWith("set server")
+            ? "\n"
+            : HEADER + "seatwave,seatwave-1,0," + status[0] + ",\n");
   }
 
   private static String text(ByteArrayOutputStream stream) {

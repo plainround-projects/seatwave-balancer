@@ -18,7 +18,9 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.Properties;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -30,6 +32,10 @@ class HarnessCliTest {
       "{\"holdId\":\"11111111-2222-3333-4444-555555555555\",\"eventId\":1,\"seat\":\"A-7\","
           + "\"state\":\"held\",\"expiresAt\":\"2026-11-11T09:05:00Z\"}";
   private static final String STAT_HEADER = "# pxname,svname,scur,stot,wretr,wredis,status,\n";
+  // The victim answers the first 30 requests (10 of them in the warm-up).
+  private static final int VICTIM_REQUESTS = 30;
+  // Long enough that the victim's last answer has certainly arrived before it is shown down.
+  private static final long VICTIM_DOWN_AFTER_NANOS = TimeUnit.MILLISECONDS.toNanos(200);
 
   @TempDir Path folder;
 
@@ -37,21 +43,24 @@ class HarnessCliTest {
   private FakeBalancer balancer;
   private final AtomicInteger requests = new AtomicInteger();
   private final AtomicInteger reads = new AtomicInteger();
+  // The stand-in answers as seatwave-2 for its first requests, then as seatwave-1, and the fake
+  // balancer shows seatwave-2 down only well after that: a kill, as the report analyses it.
+  private final AtomicLong victimGoneNanos = new AtomicLong(Long.MAX_VALUE);
 
   @BeforeEach
   void startStandIns() throws IOException {
     seatwave = HttpServer.create(new InetSocketAddress(InetAddress.getLoopbackAddress(), 0), 50);
     seatwave.createContext("/", this::answer);
     seatwave.start();
-    AtomicInteger reading = new AtomicInteger();
-    // The second reading onwards shows seatwave-2 down, so the watch records one change.
     balancer =
         new FakeBalancer(command ->
             STAT_HEADER
                 + "seatwave,BACKEND,0,"
-                + reading.get()
+                + requests.get()
                 + ",0,0,UP,\nseatwave,seatwave-2,0,0,0,0,"
-                + (reading.getAndIncrement() == 0 ? "UP" : "DOWN")
+                + (System.nanoTime() - victimGoneNanos.get() > VICTIM_DOWN_AFTER_NANOS
+                    ? "DOWN"
+                    : "UP")
                 + ",\n");
   }
 
@@ -75,9 +84,12 @@ class HarnessCliTest {
     assertThat(status).isZero();
     assertThat(report)
         .contains("sent 100, answered 100, failed 0")
+        .contains("mix: 50 holds (POST), 50 reads (GET)")
         .contains("statuses: 200 ")
-        .contains("share by instance: stand-in 100.0% (100)")
         .contains("lb1 seatwave-2: UP -> DOWN")
+        .contains("removal of seatwave-2:")
+        .contains("taken out by lb1 at ")
+        .contains("failed requests sent in between: 0; after: 0; Little's Law without retries:")
         .contains("timeline:");
     assertThat(reads.get()).isPositive();
     assertThat(requests.get()).isEqualTo(110);
@@ -100,6 +112,37 @@ class HarnessCliTest {
   }
 
   @Test
+  void reportsAMissingTimeoutOnceWithoutTheRuleThatNeedsIt() {
+    Properties properties = settings("none");
+    properties.remove("load.connectTimeoutMillis");
+    properties.remove("load.requestTimeoutMillis");
+
+    Result<HarnessSettings, List<String>> read =
+        HarnessSettings.from(new SettingsReader(properties));
+
+    assertThat(read)
+        .isEqualTo(
+            Result.error(
+                List.of(
+                    "load.connectTimeoutMillis is missing",
+                    "load.requestTimeoutMillis is missing")));
+  }
+
+  @Test
+  void refusesATargetWithAShortAddressOrAPortOutOfRange() {
+    for (String target :
+        List.of("http://127.0.1:21000", "http://127.0.0.1:99999", "http://127.0.0.1:021000")) {
+      Properties properties = settings("none");
+      properties.setProperty("target.url", target);
+
+      Result<HarnessSettings, List<String>> read =
+          HarnessSettings.from(new SettingsReader(properties));
+
+      assertThat(read).as(target).isInstanceOf(Result.Error.class);
+    }
+  }
+
+  @Test
   void namesABadBalancerEntry() {
     Properties properties = settings("none");
     properties.setProperty("watch.balancers", "lb1=10.210.10.21");
@@ -117,14 +160,20 @@ class HarnessCliTest {
 
   private void answer(HttpExchange exchange) throws IOException {
     try (exchange) {
-      requests.incrementAndGet();
+      // The number this request got, read once, so two overlapping requests never share one.
+      int number = requests.incrementAndGet();
       exchange.getRequestBody().readAllBytes();
       boolean isHold = exchange.getRequestMethod().equals("POST");
       if (!isHold) {
         reads.incrementAndGet();
       }
       byte[] body = HOLD.getBytes(StandardCharsets.UTF_8);
-      exchange.getResponseHeaders().set("X-Served-By", "stand-in");
+      if (number == VICTIM_REQUESTS + 1) {
+        victimGoneNanos.set(System.nanoTime());
+      }
+      exchange
+          .getResponseHeaders()
+          .set("X-Served-By", number <= VICTIM_REQUESTS ? "seatwave-2" : "seatwave-1");
       exchange.getResponseHeaders().set("X-Balancer", "lb1");
       exchange.sendResponseHeaders(isHold ? 201 : 200, body.length);
       try (OutputStream stream = exchange.getResponseBody()) {

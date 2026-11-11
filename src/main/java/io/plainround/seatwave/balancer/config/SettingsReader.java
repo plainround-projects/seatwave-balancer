@@ -25,6 +25,11 @@ import java.util.regex.Pattern;
  */
 public final class SettingsReader {
 
+  // A path as a file system can hold it: any character but a control character (a line break or a
+  // NUL cannot be part of a real file name), up to 4,096 characters, Linux's PATH_MAX. Spaces, "+"
+  // and deep folders are allowed, because a reader's checkout may sit in any of them.
+  private static final Pattern FILE_PATH = Pattern.compile("[^\\p{Cntrl}]{1,4096}");
+
   private final Properties properties;
   private final List<String> problems = new ArrayList<>();
 
@@ -42,7 +47,8 @@ public final class SettingsReader {
    *
    * @param path the file
    * @return the loaded properties
-   * @throws IOException if the file does not exist or cannot be read; the message says which
+   * @throws IOException if the file does not exist, cannot be read or is not a properties file; the
+   *     message says which
    */
   public static Properties load(Path path) throws IOException {
     Objects.requireNonNull(path, "path");
@@ -51,6 +57,16 @@ public final class SettingsReader {
       properties.load(reader);
     } catch (NoSuchFileException missing) {
       throw new IOException("the settings file " + path + " does not exist", missing);
+    } catch (IllegalArgumentException malformed) {
+      // Properties.load refuses a broken escape (a backslash and a u with fewer than four hex
+      // digits) with this unchecked exception; a typo in a settings file is an expected failure,
+      // so it is reported like an unreadable file.
+      throw new IOException(
+          "the settings file "
+              + path
+              + " is not a valid properties file: "
+              + malformed.getMessage(),
+          malformed);
     }
     return properties;
   }
@@ -115,6 +131,16 @@ public final class SettingsReader {
       return "";
     }
     return text;
+  }
+
+  /**
+   * Reads a file path.
+   *
+   * @param key the key
+   * @return the trimmed path, or an empty string if the key is missing or holds a control character
+   */
+  public String filePath(String key) {
+    return textMatching(key, FILE_PATH);
   }
 
   /**

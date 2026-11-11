@@ -61,7 +61,7 @@ public final class SeatWaveCli {
    */
   static Optional<Running> start(String[] arguments, PrintStream out, PrintStream err) {
     if (arguments.length != 2 || !INSTANCE_NAME.matcher(arguments[1]).matches()) {
-      err.println("usage: serve <seatwave.properties> <instance name, such as seatwave-1>");
+      err.println("usage: SeatWaveCli <seatwave.properties> <instance name, such as seatwave-1>");
       return Optional.empty();
     }
     Optional<ServiceSettings> loaded =

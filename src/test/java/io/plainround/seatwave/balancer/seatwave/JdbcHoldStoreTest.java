@@ -4,6 +4,10 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import com.github.sviperll.result4j.Result;
+import java.sql.Connection;
+import java.sql.ResultSet;
+import java.sql.SQLException;
+import java.sql.Statement;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
@@ -16,6 +20,8 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+import javax.sql.DataSource;
 import org.h2.jdbcx.JdbcDataSource;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -129,6 +135,47 @@ class JdbcHoldStoreTest {
   }
 
   @Test
+  void answersTheLoserOfAKeyRaceWithTheWinnersHoldAndReleasesItsSeat() throws Exception {
+    // Two requests with one key take two different seats, so no row lock orders them; both reach
+    // the INSERT, and the unique key refuses the second (SQLState 23505). The same fingerprint
+    // makes the loser a retry of the winner, so it must answer the winner's hold.
+    AtomicInteger rollbacks = new AtomicInteger();
+    JdbcHoldStore racing =
+        new JdbcHoldStore(
+            JdbcStandIns.meetingAtTheInsert(dataSource, 2, rollbacks), clock, CHECK_TIMEOUT);
+
+    List<Result<GrantedHold, HoldRefusal>> outcomes =
+        race(racing, 2, racer -> command("\"one-key\"", SHA_A, racer == 0 ? "D-1" : "D-2"));
+
+    GrantedHold first = granted(outcomes.get(0));
+    GrantedHold second = granted(outcomes.get(1));
+    assertThat(first.hold().holdId()).isEqualTo(second.hold().holdId());
+    assertThat(List.of(first.isReplay(), second.isReplay())).containsExactlyInAnyOrder(true, false);
+    assertThat(rollbacks.get()).isEqualTo(1);
+    assertThat(heldSeats()).isEqualTo(1);
+  }
+
+  @Test
+  void refusesTheLoserOfAKeyRaceWithAnotherBodyAndHoldsOneSeat() throws Exception {
+    AtomicInteger rollbacks = new AtomicInteger();
+    JdbcHoldStore racing =
+        new JdbcHoldStore(
+            JdbcStandIns.meetingAtTheInsert(dataSource, 2, rollbacks), clock, CHECK_TIMEOUT);
+
+    List<Result<GrantedHold, HoldRefusal>> outcomes =
+        race(
+            racing,
+            2,
+            racer ->
+                command("\"one-key\"", racer == 0 ? SHA_A : SHA_B, racer == 0 ? "E-1" : "E-2"));
+
+    assertThat(outcomes).filteredOn(outcome -> outcome instanceof Result.Success<?, ?>).hasSize(1);
+    assertThat(outcomes).contains(Result.error(new HoldRefusal.KeyReused()));
+    assertThat(rollbacks.get()).isEqualTo(1);
+    assertThat(heldSeats()).isEqualTo(1);
+  }
+
+  @Test
   void saysTheDatabaseIsReachableWhenItAnswers() {
     assertThat(store.isReachable()).isTrue();
   }
@@ -159,10 +206,15 @@ class JdbcHoldStoreTest {
   }
 
   private List<Result<GrantedHold, HoldRefusal>> race(RacerCommand commands) throws Exception {
+    return race(store, RACERS, commands);
+  }
+
+  private static List<Result<GrantedHold, HoldRefusal>> race(
+      JdbcHoldStore store, int racers, RacerCommand commands) throws Exception {
     CountDownLatch go = new CountDownLatch(1);
     List<Future<Result<GrantedHold, HoldRefusal>>> futures = new ArrayList<>();
-    try (ExecutorService threads = Executors.newFixedThreadPool(RACERS)) {
-      for (int racer = 0; racer < RACERS; racer++) {
+    try (ExecutorService threads = Executors.newFixedThreadPool(racers)) {
+      for (int racer = 0; racer < racers; racer++) {
         HoldCommand command = commands.forRacer(racer);
         Callable<Result<GrantedHold, HoldRefusal>> attempt =
             () -> {
@@ -198,10 +250,17 @@ class JdbcHoldStoreTest {
     HoldCommand forRacer(int racer);
   }
 
-  private static JdbcDataSource unreachable() {
-    // Port 1 on this machine: nothing listens there, so every connection is refused at once.
-    JdbcDataSource down = new JdbcDataSource();
-    down.setURL("jdbc:h2:tcp://127.0.0.1:1/nowhere");
-    return down;
+  private long heldSeats() throws SQLException {
+    try (Connection connection = dataSource.getConnection();
+        Statement statement = connection.createStatement();
+        ResultSet rows =
+            statement.executeQuery("SELECT COUNT(*) FROM seats WHERE status = 'HELD'")) {
+      rows.next();
+      return rows.getLong(1);
+    }
+  }
+
+  private static DataSource unreachable() {
+    return JdbcStandIns.unreachable();
   }
 }

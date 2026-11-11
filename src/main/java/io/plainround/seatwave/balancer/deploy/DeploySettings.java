@@ -21,7 +21,8 @@ import java.util.regex.Pattern;
  * @param drainTimeout the longest wait for a drained server's sessions to reach zero
  * @param stopTimeout what {@code docker compose stop -t} gives the instance before SIGKILL; longer
  *     than the instance's own drain deadline
- * @param upTimeout the longest wait for the restarted instance to pass its checks again
+ * @param upTimeout the longest wait for the balancers' checks to see a change of the instance: down
+ *     after it was stopped, then up after it was started (both waits are paced by the same checks)
  * @param settle the wait after an instance is back, so slow start has ramped it before the next
  * @param poll how often the balancers are read while waiting
  * @param auditFile where one line per change is appended
@@ -41,9 +42,6 @@ public record DeploySettings(
   private static final Pattern PROJECT = Pattern.compile("seatwave-balancer");
   private static final Pattern NAME = Pattern.compile("[a-z][a-z0-9_-]{0,63}");
   private static final Pattern ENTRY = Pattern.compile("[a-z0-9=.:-]{1,64}");
-  // Any path a file system accepts, spaces and long folders included, but no control character
-  // (a newline would let a value end one line of a log and start another).
-  private static final Pattern FILE = Pattern.compile("[^\\p{Cntrl}]{1,4096}");
   private static final int MAX_WAIT_MILLIS = 600_000;
   private static final int MIN_POLL_MILLIS = 10;
   private static final int RUNTIME_API_TIMEOUT_MILLIS = 2_000;
@@ -75,12 +73,16 @@ public record DeploySettings(
     List<String> backends = reader.listMatching("deploy.backends", NAME);
     List<String> entries = reader.listMatching("deploy.balancers", ENTRY);
     Duration drain = reader.millisBetween("deploy.drainTimeoutMillis", 1, MAX_WAIT_MILLIS);
+    int problemsBeforeStop = reader.problems().size();
     Duration stop = reader.millisBetween("deploy.stopTimeoutMillis", 1, MAX_WAIT_MILLIS);
+    // The whole-seconds rule is checked only on a value that was read; a missing or invalid key
+    // already has its own problem line.
+    boolean stopRead = reader.problems().size() == problemsBeforeStop;
     Duration up = reader.millisBetween("deploy.upTimeoutMillis", 1, MAX_WAIT_MILLIS);
     Duration settle = reader.millisBetween("deploy.settleMillis", 0, MAX_WAIT_MILLIS);
     Duration poll = reader.millisBetween("deploy.pollMillis", MIN_POLL_MILLIS, MAX_WAIT_MILLIS);
-    String audit = reader.textMatching("deploy.auditFile", FILE);
-    if (stop.toSeconds() < 1) {
+    String audit = reader.filePath("deploy.auditFile");
+    if (stopRead && stop.toSeconds() < 1) {
       reader.addProblem(
           "deploy.stopTimeoutMillis must be at least 1000: docker counts whole seconds");
     }

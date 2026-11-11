@@ -1,6 +1,8 @@
 package io.plainround.seatwave.balancer.harness;
 
 import io.plainround.seatwave.balancer.haproxy.StatRow;
+import java.math.BigDecimal;
+import java.math.RoundingMode;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
@@ -10,7 +12,6 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.TreeMap;
 import java.util.TreeSet;
-import java.util.concurrent.TimeUnit;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
@@ -28,8 +29,12 @@ final class RunReport {
   private static final double PERCENT = 100.0;
   private static final double MEDIAN = 0.50;
   private static final double P99 = 0.99;
+  // The digits the Little's Law line prints of the victim's share and of the detection time.
+  private static final int SHARE_DIGITS = 4;
+  private static final int SECONDS_DIGITS = 3;
 
   private final HarnessSettings settings;
+  private final LoadRun.Mix mix;
   private final List<Outcome> outcomes;
   private final List<StateChange> changes;
   private final Map<String, List<StatRow>> backendRows;
@@ -38,16 +43,19 @@ final class RunReport {
    * Prepares a report.
    *
    * @param settings the run's settings
+   * @param mix what the requests due after time zero were
    * @param outcomes every request's outcome
    * @param changes the balancers' status changes, from every watch
    * @param backendRows per balancer, the watched backend's summary row first and last read
    */
   RunReport(
       HarnessSettings settings,
+      LoadRun.Mix mix,
       List<Outcome> outcomes,
       List<StateChange> changes,
       Map<String, List<StatRow>> backendRows) {
     this.settings = Objects.requireNonNull(settings, "settings");
+    this.mix = Objects.requireNonNull(mix, "mix");
     // The warm-up's requests started before time zero and are left out of every number.
     this.outcomes = outcomes.stream().filter(outcome -> outcome.sentNanos() >= 0).toList();
     this.changes = changes.stream().sorted(Comparator.comparingLong(StateChange::atNanos)).toList();
@@ -201,6 +209,16 @@ final class RunReport {
             failedCount,
             sent == 0 ? 0 : failedCount * PERCENT / sent,
             outcomes.size() - sent));
+    // What really ran, so a run labelled "50% holds" shows whether it was.
+    lines.add(
+        String.format(
+            Locale.ROOT,
+            "mix: %d holds (POST), %d reads (GET), of which %d of a hold not made yet; %d hold"
+                + " replies the harness could not read",
+            mix.holds(),
+            mix.reads(),
+            mix.readsOfUnknownHold(),
+            mix.unreadableHoldReplies()));
     lines.add(
         "statuses: "
             + joined(
@@ -264,8 +282,10 @@ final class RunReport {
       return;
     }
     long detectionNanos = analysis.removedNanos() - analysis.lastAnswerNanos();
-    double expected =
-        settings.ratePerSecond() * analysis.victimShare() * detectionNanos / NANOS_PER_SECOND;
+    // The product of the factors as printed, so the line multiplies out for a reader.
+    double shownShare = roundTo(analysis.victimShare(), SHARE_DIGITS);
+    double shownSeconds = roundTo(detectionNanos / NANOS_PER_SECOND, SECONDS_DIGITS);
+    double expected = settings.ratePerSecond() * shownShare * shownSeconds;
     lines.add(
         String.format(
             Locale.ROOT,
@@ -277,12 +297,12 @@ final class RunReport {
         String.format(
             Locale.ROOT,
             "  failed requests sent in between: %d; after: %d; Little's Law without retries:"
-                + " %d requests/s x %.3f share x %.3f s = %.0f",
+                + " %d requests/s x %.4f share x %.3f s = %.0f",
             analysis.failedBetween(),
             analysis.failedAfter(),
             settings.ratePerSecond(),
-            analysis.victimShare(),
-            detectionNanos / NANOS_PER_SECOND,
+            shownShare,
+            shownSeconds,
             expected));
   }
 
@@ -393,6 +413,10 @@ final class RunReport {
     return sorted.get(Math.max(0, index));
   }
 
+  private static double roundTo(double value, int digits) {
+    return BigDecimal.valueOf(value).setScale(digits, RoundingMode.HALF_UP).doubleValue();
+  }
+
   private static String millis(long nanos) {
     return String.format(Locale.ROOT, "%.1f ms", nanos / NANOS_PER_MILLI);
   }
@@ -427,17 +451,6 @@ final class RunReport {
     KillAnalysis {
       Objects.requireNonNull(victim, "victim");
       Objects.requireNonNull(removedBy, "removedBy");
-    }
-
-    /**
-     * Returns the time from the last answer to the removal, in milliseconds.
-     *
-     * @return the detection time, or empty if no removal was seen
-     */
-    Optional<Long> detectionMillis() {
-      return isRemoved
-          ? Optional.of(TimeUnit.NANOSECONDS.toMillis(removedNanos - lastAnswerNanos))
-          : Optional.empty();
     }
   }
 

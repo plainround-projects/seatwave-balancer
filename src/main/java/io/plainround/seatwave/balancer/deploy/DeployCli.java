@@ -12,6 +12,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.time.Clock;
+import java.time.Duration;
 import java.util.List;
 import java.util.Optional;
 
@@ -106,27 +107,50 @@ public final class DeployCli {
       Clock clock) {
     try {
       audit(settings, clock, "deploy: started on " + settings.instances());
-      Result<Integer, String> result = rolling.run();
-      return switch (result) {
-        case Result.Success<Integer, String>(Integer restarted) -> {
-          audit(settings, clock, "deploy: finished, " + restarted + " instances restarted");
-          out.println("deploy finished: " + restarted + " instances restarted, all up");
-          yield 0;
-        }
-        case Result.Error<Integer, String>(String reason) -> {
-          audit(settings, clock, "deploy: stopped: " + reason);
-          err.println("deploy stopped: " + reason);
-          yield EXIT_FAILED;
-        }
-      };
     } catch (IOException cannotAudit) {
-      err.println("deploy stopped: the audit file cannot be written: " + cannotAudit.getMessage());
+      err.println(
+          "deploy not started: the audit file cannot be written: "
+              + cannotAudit.getMessage()
+              + "; nothing changed");
       return EXIT_FAILED;
+    }
+    Result<Integer, String> result;
+    try {
+      result = rolling.run();
     } catch (InterruptedException interrupted) {
       Thread.currentThread().interrupt();
       err.println("deploy interrupted");
       return EXIT_FAILED;
     }
+    // The deploy's own outcome is printed first, so a failing audit file never hides what happened
+    // to the instances.
+    String auditLine;
+    int status;
+    switch (result) {
+      case Result.Success<Integer, String>(Integer restarted) -> {
+        out.println("deploy finished: " + restarted + " instances restarted, all up");
+        auditLine = "deploy: finished, " + restarted + " instances restarted";
+        status = 0;
+      }
+      case Result.Error<Integer, String>(String reason) -> {
+        err.println("deploy stopped: " + reason);
+        auditLine = "deploy: stopped: " + reason;
+        status = EXIT_FAILED;
+      }
+    }
+    try {
+      audit(settings, clock, auditLine);
+    } catch (IOException cannotAudit) {
+      // A guardrail failed, so the exit status is not 0, but the message says what really happened.
+      err.println(
+          "the audit line of this deploy cannot be written ("
+              + cannotAudit.getMessage()
+              + "); the deploy itself "
+              + (status == 0 ? "finished" : "stopped")
+              + " as printed above");
+      return EXIT_FAILED;
+    }
+    return status;
   }
 
   private static void printPlan(DeploySettings settings, PrintStream out) {
@@ -182,6 +206,6 @@ public final class DeployCli {
      * @param stopTimeout docker's stop timeout
      * @return the runner
      */
-    Containers create(String project, java.time.Duration stopTimeout);
+    Containers create(String project, Duration stopTimeout);
   }
 }

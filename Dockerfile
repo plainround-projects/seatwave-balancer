@@ -8,15 +8,17 @@
 FROM eclipse-temurin:25.0.5_8-jdk-noble@sha256:95e350ad1eb738f943e141640f7e3d797e483359a3b33c3864255bfd1ad71f8a AS runtime
 COPY build/stack/lib/ /app/lib/
 RUN modules="$(jdeps --print-module-deps --ignore-missing-deps --multi-release 25 \
-        --class-path '/app/lib/*' /app/lib/seatwave-balancer-1.0.0.jar /app/lib/postgresql-42.7.14.jar)" \
+        --class-path '/app/lib/*' /app/lib/seatwave-balancer-1.1.0.jar /app/lib/postgresql-42.7.14.jar)" \
     && echo "linking modules: ${modules}" \
     && jlink --add-modules "${modules}" --strip-debug --no-man-pages --no-header-files \
         --output /opt/seatwave-java
 
 # Stage 2: the plain operating system image and the linked runtime, run by a user without a
-# login, a home folder or any rights beyond reading the application.
+# login, a home folder or any rights beyond reading the application. 10001 is above Ubuntu's
+# range of system user ids (up to 999), so it is an ordinary user (as the Module 9 project now
+# writes it); /nonexistent is Debian's name for "no home folder", which it really does not have.
 FROM ubuntu:noble@sha256:fe81560990fae86dc4743202b2cb4d3df98d0bcf949173cecef15ce1127ef852
-RUN useradd --system --uid 10001 --no-create-home --shell /usr/sbin/nologin seatwave
+RUN useradd --uid 10001 --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin seatwave
 COPY --from=runtime /opt/seatwave-java /opt/seatwave-java
 COPY --from=runtime /app/lib/ /app/lib/
 COPY config/ /app/config/

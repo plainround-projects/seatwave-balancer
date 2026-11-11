@@ -73,9 +73,10 @@ final class HoldRoutes {
     }
     Matcher holdPath = HOLD_PATH.matcher(path);
     if (holdPath.matches()) {
-      return request.method().equals("GET")
+      // HEAD is GET without a body (RFC 9110); the server leaves the body out when it writes.
+      return request.method().equals("GET") || request.method().equals("HEAD")
           ? new Routed("GET /v1/holds/{holdId}", readHold(request, holdPath.group(1)))
-          : new Routed("other", notAllowed(request, "GET"));
+          : new Routed("other", notAllowed(request, "GET, HEAD"));
     }
     return new Routed("other", notFound(request));
   }
@@ -105,7 +106,7 @@ final class HoldRoutes {
       return problems.of(
           TOO_LARGE,
           "body-too-large",
-          "The body is over 1,024 bytes",
+          "The body is too large",
           "send at most " + MAX_BODY_BYTES + " bytes",
           request.correlationId());
     }
@@ -127,7 +128,13 @@ final class HoldRoutes {
           checked(request, parsed);
       case Result.Error<HoldRequestBody, JsonCodec.BindingProblem>(
               JsonCodec.BindingProblem problem) ->
-          invalid(request, List.of(problem.pointer() + " " + problem.detail()));
+          // A whole-body problem has the empty pointer (RFC 6901), so its detail stands alone.
+          invalid(
+              request,
+              List.of(
+                  problem.pointer().isEmpty()
+                      ? problem.detail()
+                      : problem.pointer() + " " + problem.detail()));
     };
   }
 

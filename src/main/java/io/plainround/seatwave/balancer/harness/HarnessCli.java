@@ -82,12 +82,15 @@ public final class HarnessCli {
       threads.add(Thread.ofPlatform().name("watch-" + balancer.name()).start(watch));
     }
     List<Outcome> outcomes;
+    LoadRun.Mix mix;
     try (HttpClient client =
         HttpClient.newBuilder()
             .version(HttpClient.Version.HTTP_1_1)
             .connectTimeout(settings.connectTimeout())
             .build()) {
-      outcomes = new LoadRun(settings, client, startNanos, keyPrefix).run();
+      LoadRun load = new LoadRun(settings, client, startNanos, keyPrefix);
+      outcomes = load.run();
+      mix = load.mix();
     } finally {
       // Stopped on every path, so no watch thread outlives the run.
       for (BalancerWatch watch : watches) {
@@ -103,6 +106,6 @@ public final class HarnessCli {
       changes.addAll(watch.changes());
       watch.backendRows().ifPresent(rows -> backendRows.put(watch.balancerName(), rows));
     }
-    return new RunReport(settings, outcomes, changes, backendRows);
+    return new RunReport(settings, mix, outcomes, changes, backendRows);
   }
 }

@@ -50,6 +50,17 @@ class StatTableTest {
   }
 
   @Test
+  void callsOnlyAPlainUpFullyUp() throws IOException {
+    StatTable table =
+        StatTable.parse("# pxname,svname,status,\nb,s1,UP,\nb,s2,UP 2/3,\nb,s3,DOWN 1/2,\n");
+
+    assertThat(table.server("b", "s1").orElseThrow().isFullyUp()).isTrue();
+    assertThat(table.server("b", "s2").orElseThrow().isFullyUp()).isFalse();
+    assertThat(table.server("b", "s2").orElseThrow().isUp()).isTrue();
+    assertThat(table.server("b", "s3").orElseThrow().isFullyUp()).isFalse();
+  }
+
+  @Test
   void refusesAnAnswerThatIsNotAStatTable() {
     assertThatThrownBy(() -> StatTable.parse("Unknown command: 'show stats'\n"))
         .isInstanceOf(IOException.class)

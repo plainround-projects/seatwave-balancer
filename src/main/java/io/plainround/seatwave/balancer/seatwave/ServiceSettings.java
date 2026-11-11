@@ -40,9 +40,6 @@ public record ServiceSettings(
   private static final Pattern JDBC_URL =
       Pattern.compile("jdbc:(postgresql://[A-Za-z0-9.-]{1,100}:[0-9]{1,5}/[a-z_]{1,32}|h2:mem:.*)");
   private static final Pattern USER = Pattern.compile("[a-z_][a-z0-9_]{0,31}");
-  // Any path a file system accepts, spaces and long folders included, but no control character
-  // (a newline would let a value end one line of a log and start another).
-  private static final Pattern FILE = Pattern.compile("[^\\p{Cntrl}]{1,4096}");
   private static final int HIGHEST_PORT = 65_535;
   private static final int MAX_WORKERS = 1_024;
   private static final int MAX_BACKLOG = 65_535;
@@ -52,6 +49,8 @@ public record ServiceSettings(
   private static final int MAX_WAIT_MILLIS = 600_000;
   // JDBC's isValid counts whole seconds, so the readiness check cannot wait less than one.
   private static final int MIN_CHECK_MILLIS = 1_000;
+  // HikariCP refuses a connectionTimeout below 250 ms with an exception (HikariConfig, 7.1.0).
+  private static final int MIN_CONNECT_MILLIS = 250;
 
   /**
    * Creates the settings.
@@ -80,20 +79,27 @@ public record ServiceSettings(
     int port = reader.intBetween("http.port", 0, HIGHEST_PORT);
     int adminPort = reader.intBetween("http.adminPort", 0, HIGHEST_PORT);
     int backlog = reader.intBetween("http.backlog", 1, MAX_BACKLOG);
+    int problemsBeforeWorkers = reader.problems().size();
     int workers = reader.intBetween("http.workerThreads", 1, MAX_WORKERS);
+    boolean workersRead = reader.problems().size() == problemsBeforeWorkers;
     int queue = reader.intBetween("http.queueCapacity", 1, MAX_QUEUE);
     String url = reader.textMatching("db.url", JDBC_URL);
     String user = reader.textMatching("db.user", USER);
-    String passwordFile = reader.textMatching("db.passwordFile", FILE);
+    String passwordFile = reader.filePath("db.passwordFile");
+    int problemsBeforePool = reader.problems().size();
     int poolSize = reader.intBetween("db.poolSize", 1, MAX_POOL);
-    Duration connect = reader.millisBetween("db.connectTimeoutMillis", 1, MAX_WAIT_MILLIS);
+    boolean poolRead = reader.problems().size() == problemsBeforePool;
+    Duration connect =
+        reader.millisBetween("db.connectTimeoutMillis", MIN_CONNECT_MILLIS, MAX_WAIT_MILLIS);
     Duration check =
         reader.millisBetween("readiness.checkTimeoutMillis", MIN_CHECK_MILLIS, MAX_WAIT_MILLIS);
     Duration drain = reader.millisBetween("drain.deadlineMillis", 0, MAX_WAIT_MILLIS);
     if (port != 0 && port == adminPort) {
       reader.addProblem("http.port and http.adminPort must differ (0 means any free port)");
     }
-    if (poolSize > workers) {
+    // A rule between two keys is checked only when both were read, so a missing key gives one
+    // problem line, not a second one about the stand-in value.
+    if (workersRead && poolRead && poolSize > workers) {
       reader.addProblem(
           "db.poolSize must not be larger than http.workerThreads: a connection no worker can use"
               + " is held open at the database for nothing");

@@ -5,7 +5,7 @@ plugins {
 }
 
 group = "io.plainround"
-version = "1.0.0"
+version = "1.1.0"
 
 java {
     toolchain {
@@ -64,8 +64,14 @@ tasks.test {
     }
     systemProperty("seatwave.schema", file("db/schema.sql").absolutePath)
     systemProperty("seatwave.haproxy", file("haproxy/haproxy.cfg").absolutePath)
+    // Every file a test reads is an input, so a change to any of them runs the tests again
+    // (the configuration rules read compose.yaml, both Dockerfiles and the settings files).
     inputs.file("db/schema.sql")
     inputs.file("haproxy/haproxy.cfg")
+    inputs.file("compose.yaml")
+    inputs.file("Dockerfile")
+    inputs.dir("keepalived")
+    inputs.dir("config")
     testLogging {
         events("passed", "failed", "skipped")
     }

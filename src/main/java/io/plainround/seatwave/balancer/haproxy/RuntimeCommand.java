@@ -3,6 +3,7 @@ package io.plainround.seatwave.balancer.haproxy;
 import java.util.Locale;
 import java.util.Objects;
 import java.util.regex.Pattern;
+import java.util.stream.Collectors;
 
 /**
  * One command for HAProxy's runtime API, built only from checked parts, so no input can add a
@@ -55,9 +56,21 @@ public record RuntimeCommand(String line) {
   private static String checked(String name, String what) {
     Objects.requireNonNull(name, what);
     if (!NAME.matcher(name).matches()) {
-      throw new IllegalArgumentException(what + " must match " + NAME.pattern() + ": " + name);
+      throw new IllegalArgumentException(
+          what + " must match " + NAME.pattern() + ", but was \"" + visible(name) + "\"");
     }
     return name;
+  }
+
+  private static String visible(String text) {
+    // A control character is shown as its code, so a newline in a name cannot break the message
+    // into two lines (one of which a reader would take for another message).
+    return text.codePoints()
+        .mapToObj(codePoint ->
+            Character.isISOControl(codePoint)
+                ? String.format(Locale.ROOT, "\\u%04x", codePoint)
+                : Character.toString(codePoint))
+        .collect(Collectors.joining());
   }
 
   /** The administrative states the runtime API can set on a server. */

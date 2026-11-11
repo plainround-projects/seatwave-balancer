@@ -6,6 +6,7 @@ import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.core.JsonToken;
 import com.fasterxml.jackson.core.StreamReadFeature;
 import com.fasterxml.jackson.core.exc.InputCoercionException;
+import com.fasterxml.jackson.core.exc.StreamReadException;
 import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.JsonMappingException;
 import com.fasterxml.jackson.databind.MapperFeature;
@@ -34,6 +35,10 @@ public final class JsonCodec {
 
   // RFC 6901: the empty pointer is the whole document.
   private static final String WHOLE_BODY = "";
+  // Jackson has no exception type of its own for a repeated field; STRICT_DUPLICATE_DETECTION
+  // reports it as a parse error with this message, so the message is the only signal. A test pins
+  // it, so a Jackson version that words it differently fails the build instead of the reason.
+  private static final String DUPLICATE_MESSAGE = "Duplicate field '";
 
   private final ObjectMapper mapper =
       JsonMapper.builder()
@@ -78,11 +83,9 @@ public final class JsonCodec {
         return Result.error(new BindingProblem(WHOLE_BODY, "the body must be a JSON object"));
       }
       T value = mapper.readValue(parser, type);
-      if (parser.nextToken() != null) {
-        return Result.error(
-            new BindingProblem(WHOLE_BODY, "the body has data after the JSON object"));
-      }
-      return Result.success(value);
+      return hasMore(parser)
+          ? Result.error(new BindingProblem(WHOLE_BODY, "the body has data after the JSON object"))
+          : Result.success(value);
     } catch (UnrecognizedPropertyException unknownField) {
       return Result.error(
           new BindingProblem(
@@ -94,6 +97,14 @@ public final class JsonCodec {
       if (unbound.getCause() instanceof InputCoercionException) {
         return Result.error(
             new BindingProblem(pointerOf(unbound), "is out of range for this field"));
+      }
+      return Result.error(new BindingProblem(WHOLE_BODY, "the body is not valid JSON"));
+    } catch (StreamReadException malformed) {
+      if (malformed.getOriginalMessage().startsWith(DUPLICATE_MESSAGE)
+          && malformed.getProcessor() != null) {
+        // The parser stopped on the repeated name, so its context is the path of that field.
+        String pointer = malformed.getProcessor().getParsingContext().pathAsPointer().toString();
+        return Result.error(new BindingProblem(pointer, "appears more than once"));
       }
       return Result.error(new BindingProblem(WHOLE_BODY, "the body is not valid JSON"));
     } catch (JacksonException malformed) {
@@ -116,6 +127,16 @@ public final class JsonCodec {
       return mapper.writeValueAsString(value);
     } catch (JsonProcessingException notWritable) {
       throw new IllegalArgumentException("not writable as JSON", notWritable);
+    }
+  }
+
+  private static boolean hasMore(JsonParser parser) throws IOException {
+    try {
+      return parser.nextToken() != null;
+    } catch (JacksonException notJson) {
+      // Text after the object that is not JSON at all ("{...} x") is still data after the object,
+      // and that is the reason the client needs, not "not valid JSON".
+      return true;
     }
   }
 

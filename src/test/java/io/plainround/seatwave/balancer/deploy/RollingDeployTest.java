@@ -46,6 +46,42 @@ class RollingDeployTest {
   }
 
   @Test
+  void startsAnInstanceOnlyAfterEveryBalancerHasSeenItDown() throws InterruptedException {
+    // The checks take three readings to notice the stop, as real checks take seconds.
+    world.readsUntilSeenDown = 3;
+
+    Result<Integer, String> result = deploy(List.of(world.balancer("lb1"), world.balancer("lb2")));
+
+    assertThat(result).isEqualTo(Result.success(2));
+    assertThat(calls).contains("start seatwave-1 while DOWN", "start seatwave-2 while DOWN");
+    assertThat(calls).noneMatch(call -> call.startsWith("start") && call.endsWith("while UP"));
+  }
+
+  @Test
+  void waitsTheSettleTimeBeforeTheNextInstance() throws InterruptedException {
+    Duration settle = Duration.ofMillis(300);
+
+    Result<Integer, String> result = deploy(List.of(world.balancer("lb1")), settle);
+
+    assertThat(result).isEqualTo(Result.success(2));
+    // A lower bound only: a sleep is never shorter than asked, however busy the machine is.
+    assertThat(world.secondDrainNanos - world.firstReadyNanos)
+        .isGreaterThanOrEqualTo(settle.toNanos());
+  }
+
+  @Test
+  void changesNothingWhenAnInstanceIsAlreadyFailingItsChecks() throws InterruptedException {
+    world.status.put("seatwave/seatwave-2", "UP 1/3");
+
+    Result<Integer, String> result = deploy(List.of(world.balancer("lb1")));
+
+    assertThat(result)
+        .isEqualTo(
+            Result.error("check before: lb1 sees seatwave/seatwave-2 UP 1/3; nothing was changed"));
+    assertThat(calls).isEmpty();
+  }
+
+  @Test
   void changesNothingWhenAnInstanceIsNotUpBeforehand() throws InterruptedException {
     world.status.put("seatwave/seatwave-2", "DOWN");
 
@@ -90,15 +126,20 @@ class RollingDeployTest {
 
   private Result<Integer, String> deploy(List<BalancerControl> balancers)
       throws InterruptedException {
+    return deploy(balancers, Duration.ZERO);
+  }
+
+  private Result<Integer, String> deploy(List<BalancerControl> balancers, Duration settle)
+      throws InterruptedException {
     return new RollingDeploy(
-            settings(),
+            settings(settle),
             balancers,
             world.containers(),
             new PrintStream(new ByteArrayOutputStream(), true, StandardCharsets.UTF_8))
         .run();
   }
 
-  private static DeploySettings settings() {
+  private static DeploySettings settings(Duration settle) {
     return new DeploySettings(
         "seatwave-balancer",
         INSTANCES,
@@ -107,7 +148,7 @@ class RollingDeployTest {
         Duration.ofMillis(200),
         Duration.ofSeconds(1),
         Duration.ofMillis(200),
-        Duration.ZERO,
+        settle,
         Duration.ofMillis(10),
         Path.of("build/unused-audit.log"));
   }
@@ -118,6 +159,11 @@ class RollingDeployTest {
     private volatile boolean sessionsStayOpen;
     private volatile boolean isAnswering = true;
     private volatile boolean staysDownAfterStart;
+    // Readings of the balancers after a stop before they show the instance down; 0 is at once.
+    private volatile int readsUntilSeenDown;
+    private final Map<String, Integer> readsLeft = new ConcurrentHashMap<>();
+    private volatile long firstReadyNanos;
+    private volatile long secondDrainNanos;
 
     World() {
       for (String backend : BACKENDS) {
@@ -139,6 +185,12 @@ class RollingDeployTest {
           if (!isAnswering) {
             throw new IOException("the test balancer is off");
           }
+          readsLeft.replaceAll((service, left) -> {
+            if (left == 1) {
+              BACKENDS.forEach(backend -> status.put(backend + "/" + service, "DOWN"));
+            }
+            return Math.max(0, left - 1);
+          });
           List<StatRow> rows = new ArrayList<>();
           status.forEach((key, value) -> {
             String[] parts = key.split("/");
@@ -160,6 +212,12 @@ class RollingDeployTest {
         @Override
         public void setState(String backend, String server, AdminState state) {
           calls.add(name + " " + backend + "/" + server + " " + state);
+          if (server.equals("seatwave-1") && state == AdminState.READY && firstReadyNanos == 0) {
+            firstReadyNanos = System.nanoTime();
+          }
+          if (server.equals("seatwave-2") && state == AdminState.DRAIN && secondDrainNanos == 0) {
+            secondDrainNanos = System.nanoTime();
+          }
         }
       };
     }
@@ -169,12 +227,17 @@ class RollingDeployTest {
         @Override
         public void stop(String service) {
           calls.add("stop " + service);
-          BACKENDS.forEach(backend -> status.put(backend + "/" + service, "DOWN"));
+          if (readsUntilSeenDown == 0) {
+            BACKENDS.forEach(backend -> status.put(backend + "/" + service, "DOWN"));
+          } else {
+            readsLeft.put(service, readsUntilSeenDown);
+          }
         }
 
         @Override
         public void start(String service) {
           calls.add("start " + service);
+          calls.add("start " + service + " while " + status.get("seatwave/" + service));
           if (!staysDownAfterStart) {
             BACKENDS.forEach(backend -> status.put(backend + "/" + service, "UP"));
           }

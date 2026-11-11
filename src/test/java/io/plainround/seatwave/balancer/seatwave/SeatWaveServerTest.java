@@ -19,6 +19,8 @@ class SeatWaveServerTest {
 
   private static final Duration DEADLINE = Duration.ofSeconds(10);
   private static final Duration TIMEOUT = Duration.ofSeconds(10);
+  // Short, so the deadline test ends in a fraction of a second instead of the server's 5 s.
+  private static final Duration WORKER_STOP_WAIT = Duration.ofMillis(100);
   private static final String BODY = "{\"eventId\":1,\"seat\":\"A-7\",\"customer\":\"fan-1\"}";
 
   private final ScriptedHoldStore store = new ScriptedHoldStore();
@@ -71,11 +73,33 @@ class SeatWaveServerTest {
   }
 
   @Test
+  void answersAHeadRequestLikeAGetWithoutABody() throws Exception {
+    start(DEADLINE);
+    server.markReady();
+
+    HttpResponse<String> health =
+        client.send(
+            HttpRequest.newBuilder(URI.create("http://127.0.0.1:" + server.adminPort() + "/health"))
+                .timeout(TIMEOUT)
+                .method("HEAD", HttpRequest.BodyPublishers.noBody())
+                .build(),
+            HttpResponse.BodyHandlers.ofString());
+
+    assertThat(health.statusCode()).isEqualTo(200);
+    assertThat(health.body()).isEmpty();
+  }
+
+  @Test
   void countsRequestsInItsMetrics() throws Exception {
     start(DEADLINE);
     server.markReady();
     hold("\"k-1\"");
 
+    // The server counts a request after it has written the answer, so the client can read the
+    // metrics a moment before the count; wait for it instead of racing it.
+    await()
+        .atMost(TIMEOUT)
+        .until(() -> admin("/metrics").body().contains("seatwave_request_seconds_count 1"));
     String metrics = admin("/metrics").body();
 
     assertThat(metrics)
@@ -102,13 +126,22 @@ class SeatWaveServerTest {
     assertThat(refused.headers().firstValue("Connection")).contains("close");
     assertThat(refused.body()).contains("nothing was done");
     assertThat(inFlight.get(TIMEOUT.toSeconds(), TimeUnit.SECONDS).statusCode()).isEqualTo(201);
-    assertThat(drained.get(TIMEOUT.toSeconds(), TimeUnit.SECONDS).isClean()).isTrue();
+    Lifecycle.DrainResult result = drained.get(TIMEOUT.toSeconds(), TimeUnit.SECONDS);
+    assertThat(result.isClean()).isTrue();
+    // Woken by the last request's release, not by the 10 s deadline (a lost wake-up is also clean).
+    assertThat(result.waited()).isLessThan(DEADLINE.dividedBy(2));
     assertThat(server.notAdmittedCount()).isEqualTo(1);
   }
 
   @Test
   void stopsAtTheDeadlineWhenARequestNeverFinishes() throws Exception {
-    start(Duration.ofMillis(200));
+    server =
+        SeatWaveServer.start(
+            TestSettings.withDrainDeadline(Duration.ofMillis(200)),
+            "seatwave-test",
+            store,
+            new MutableClock(Instant.parse("2026-11-11T09:00:00Z")),
+            WORKER_STOP_WAIT);
     server.markReady();
     store.blockHolds();
     holdAsync("\"stuck\"");
@@ -117,6 +150,7 @@ class SeatWaveServerTest {
     Lifecycle.DrainResult result = server.drainAndStop(Duration.ofMillis(200));
 
     assertThat(result.inFlightLeft()).isEqualTo(1);
+    assertThat(result.waited()).isGreaterThanOrEqualTo(Duration.ofMillis(200));
     assertThat(server.state()).isEqualTo(LifecycleState.STOPPED);
   }
 

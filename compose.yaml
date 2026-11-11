@@ -20,7 +20,7 @@ x-hardening: &hardening
 
 x-seatwave: &seatwave
   <<: *hardening
-  image: seatwave-balancer-seatwave:1.0.0
+  image: seatwave-balancer-seatwave:1.1.0
   cap_drop:
     - ALL
   # Two CPUs and 512 MB each: three instances, two balancers, the database and the harness share
@@ -34,8 +34,10 @@ x-seatwave: &seatwave
   depends_on:
     postgres:
       condition: service_healthy
-  # Longer than drain.deadlineMillis (20 s): docker stop sends SIGTERM, waits this long, then
-  # SIGKILL, so a draining instance is never killed by docker.
+  # docker stop sends SIGTERM, waits this long, then SIGKILL. The worst-case stop of an instance is
+  # drain.deadlineMillis (20 s, config/seatwave-container.properties) plus the 5 s it then gives
+  # its worker threads (SeatWaveServer.WORKER_STOP_WAIT): 25 s, inside these 30 s, so a draining
+  # instance is never killed by docker. ServiceSettingsTest checks the arithmetic.
   stop_grace_period: 30s
 
 x-balancer: &balancer
@@ -54,7 +56,7 @@ x-balancer: &balancer
 x-keepalived: &keepalived
   <<: *hardening
   build: ./keepalived
-  image: seatwave-balancer-keepalived:1.0.0
+  image: seatwave-balancer-keepalived:1.1.0
   # NET_ADMIN adds and removes the floating address; NET_RAW sends VRRP; SETUID and SETGID let it
   # run its check script as the script user. Nothing else.
   cap_drop:
@@ -185,7 +187,7 @@ services:
   # (docker compose run --rm harness <settings>); it publishes no port.
   harness:
     <<: *hardening
-    image: seatwave-balancer-seatwave:1.0.0
+    image: seatwave-balancer-seatwave:1.1.0
     profiles:
       - tools
     entrypoint: ["/opt/seatwave-java/bin/java", "-cp", "/app/lib/*", "io.plainround.seatwave.balancer.harness.HarnessCli"]

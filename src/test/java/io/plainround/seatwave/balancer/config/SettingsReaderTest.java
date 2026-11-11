@@ -4,6 +4,8 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.Properties;
@@ -60,5 +62,50 @@ class SettingsReaderTest {
     assertThatThrownBy(() -> SettingsReader.load(missing))
         .isInstanceOf(IOException.class)
         .hasMessage("the settings file " + missing + " does not exist");
+  }
+
+  @Test
+  void acceptsAFilePathInADeepFolderWithSpacesAndPlusSigns() {
+    String deepPath = "/checkouts/My Projects+Labs/" + "nested-folder/".repeat(20) + "ca.pem";
+    Properties properties = new Properties();
+    properties.setProperty("tls.authorityPem", deepPath);
+    SettingsReader reader = new SettingsReader(properties);
+
+    String path = reader.filePath("tls.authorityPem");
+
+    assertThat(deepPath).hasSizeGreaterThan(220);
+    assertThat(path).isEqualTo(deepPath);
+    assertThat(reader.problems()).isEmpty();
+  }
+
+  @Test
+  void refusesAFilePathWithAControlCharacter() {
+    Properties properties = new Properties();
+    properties.setProperty("tls.authorityPem", "build/tls/ca\t.pem");
+    SettingsReader reader = new SettingsReader(properties);
+
+    String path = reader.filePath("tls.authorityPem");
+
+    assertThat(path).isEmpty();
+    assertThat(reader.problems())
+        .singleElement()
+        .asString()
+        .startsWith("tls.authorityPem must match");
+  }
+
+  @Test
+  void reportsABrokenEscapeAsAnUnreadableSettingsFile(@TempDir Path folder) throws IOException {
+    Path broken =
+        Files.writeString(
+            folder.resolve("broken.properties"),
+            "http.bindAddress=\\u12\n",
+            StandardCharsets.UTF_8);
+
+    assertThatThrownBy(() -> SettingsReader.load(broken))
+        .isInstanceOf(IOException.class)
+        .hasMessage(
+            "the settings file "
+                + broken
+                + " is not a valid properties file: Malformed \\uxxxx encoding.");
   }
 }

@@ -41,11 +41,9 @@ public final class SettingsFiles {
         }
       };
     } catch (IOException unreadable) {
+      // SettingsReader.load also turns a broken escape into this, so only the file's own
+      // problems land here; an exception from the reading function is a bug and is not caught.
       err.println(unreadable.getMessage());
-      return Optional.empty();
-    } catch (IllegalArgumentException malformed) {
-      // Properties.load refuses a malformed \\u escape this way; it is a mistake in the file.
-      err.println("the settings file " + file + " cannot be read: " + malformed.getMessage());
       return Optional.empty();
     }
   }

@@ -14,14 +14,14 @@
 #   test    up, ./gradlew stackTest, then down, on every path (also when a test fails)
 #   status  list the project's containers and both balancers' view (read-only, no --run needed)
 #
-# Guardrails: the only target is the project seatwave-balancer; Docker must answer first or nothing
-# is done; every change appends an audit line to build/stack/audit.log; "down" checks afterwards
-# that no container, network or volume of the project is left; any failure exits non-zero.
+# Guardrails: the only target is the project seatwave-balancer; a dry run needs no Docker and
+# changes nothing; with --run, Docker must answer first or nothing is done; every change appends
+# an audit line to build/stack/audit.log; "down" checks afterwards that no container, network or
+# volume of the project is left; any failure exits non-zero.
 set -euo pipefail
 
 readonly SECRET_FILE="build/secrets/db.password"
 readonly WAIT_SECONDS=90
-readonly DOCKER_TIMEOUT_SECONDS=10
 readonly FLOATING_ADDRESS="10.210.10.100"
 
 usage() {
@@ -46,9 +46,8 @@ case "$action" in up|down|test|status) ;; *) usage ;; esac
 cd "$(dirname "$0")/.."
 source scripts/common.sh
 
-docker_must_answer
-
 if [[ "$action" == "status" ]]; then
+  docker_must_answer
   "${compose[@]}" ps --all
   for balancer in lb1 lb2; do
     echo "$balancer: $(servers_up "$balancer" seatwave) of 3 instances up in backend seatwave"
@@ -59,14 +58,16 @@ fi
 
 echo "plan: $action the Compose project $PROJECT"
 case "$action" in
-  up) echo "  password into $SECRET_FILE; ./gradlew -q stackFiles; ${compose[*]} up -d --build; wait until ready" ;;
+  up) echo "  password into $SECRET_FILE; ./gradlew -q stackFiles; ${compose[*]} up -d --build --quiet-pull; wait until ready" ;;
   down) echo "  ${compose_all[*]} down -v --remove-orphans; check nothing of $PROJECT is left" ;;
   test) echo "  up, then ./gradlew stackTest, then down -v (always)" ;;
 esac
 if [[ "$mode" == "dry-run" ]]; then
+  # Checked after the plan, so a dry run changes nothing and needs no Docker.
   echo "dry run: nothing changed. Add --run to do it."
   exit 0
 fi
+docker_must_answer
 if [[ "$confirmed" != "yes" ]]; then
   read -r -p "Go ahead with '$action' for $PROJECT? [y/N] " answer < /dev/tty
   [[ "$answer" == "y" ]] || { echo "not confirmed; nothing changed" >&2; exit 1; }
@@ -76,7 +77,11 @@ up() {
   mkdir -p build/secrets
   if [[ ! -s "$SECRET_FILE" ]]; then
     # A throwaway lab password, new for every fresh stack, never committed (.gitignore) and never
-    # copied into an image (.dockerignore). Readable by the containers' own users.
+    # copied into an image (.dockerignore). Mode rw-r--r--: on a Linux host the secret is a bind
+    # mount that keeps this file's owner and mode, and it is read by other users (PostgreSQL's
+    # entrypoint as root and again as postgres, SeatWave as uid 10001), so owner-only would fail
+    # there. Docker Desktop on a Mac shows a shared file as owned by its reader. So anyone with an
+    # account on this machine can read this lab's password, as the README says.
     # head ends the pipe itself: "tr < /dev/urandom | head" would end with SIGPIPE, and pipefail
     # would stop the script there without a word (the first version of this script did).
     (umask 022; head -c 24 /dev/urandom | base64 | tr -d '/+=\n' > "$SECRET_FILE")
@@ -85,9 +90,7 @@ up() {
   "${compose[@]}" up -d --build --quiet-pull
   audit "up: started $PROJECT"
   for (( waited = 0; waited < WAIT_SECONDS; waited++ )); do
-    if [[ "$(servers_up lb1 seatwave)" == "3" && "$(servers_up lb2 seatwave)" == "3" \
-          && "$(servers_up lb1 seatwave_active_only)" == "3" && "$(servers_up lb2 seatwave_active_only)" == "3" \
-          && "$(address_holder)" != "none" ]]; then
+    if stack_ready && [[ "$(address_holder)" != "none" ]]; then
       echo "stack is up after ${waited} s: 3 of 3 instances up on lb1 and lb2; $FLOATING_ADDRESS on $(address_holder)"
       return 0
     fi
@@ -103,11 +106,13 @@ down() {
   audit "down: removed $PROJECT"
   # Check after: nothing of this project may be left.
   local left
-  left="$(docker ps -aq --filter "label=com.docker.compose.project=$PROJECT")"
-  left+="$(docker network ls -q --filter "label=com.docker.compose.project=$PROJECT")"
-  left+="$(docker volume ls -q --filter "label=com.docker.compose.project=$PROJECT")"
+  # One id per line, from all three lists, so the message shows each one apart.
+  left="$(docker ps -aq --filter "label=com.docker.compose.project=$PROJECT";
+          docker network ls -q --filter "label=com.docker.compose.project=$PROJECT";
+          docker volume ls -q --filter "label=com.docker.compose.project=$PROJECT")"
   if [[ -n "$left" ]]; then
-    echo "something of $PROJECT is still there: $left" >&2
+    echo "something of $PROJECT is still there:" >&2
+    echo "$left" >&2
     return 1
   fi
   # The password belongs to the database that was just removed; the next stack makes a new one.

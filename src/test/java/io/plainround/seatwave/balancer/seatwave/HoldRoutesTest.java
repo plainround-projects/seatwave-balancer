@@ -67,6 +67,43 @@ class HoldRoutesTest {
   }
 
   @Test
+  void startsAWholeBodyProblemWithTheReasonNotASpace() {
+    Reply reply = post("application/json", KEY, "[1]");
+
+    assertThat(reply.status()).isEqualTo(400);
+    assertThat(reply.bodyText()).contains("\"detail\":\"the body must be a JSON object\"");
+  }
+
+  @Test
+  void namesARepeatedField() {
+    Reply reply = post("application/json", KEY, "{\"eventId\":1,\"eventId\":2}");
+
+    assertThat(reply.bodyText()).contains("\"detail\":\"/eventId appears more than once\"");
+  }
+
+  @Test
+  void readsAHoldWithHeadAsWithGet() {
+    Reply reply =
+        routes
+            .route(
+                new Request(
+                    "HEAD",
+                    "/v1/holds/11111111-2222-3333-4444-555555555555",
+                    "",
+                    "",
+                    "",
+                    new byte[0],
+                    false,
+                    "c1"))
+            .reply();
+
+    // The same answer as a GET of the same path: the server leaves only the body out.
+    assertThat(reply.status())
+        .isEqualTo(get("/v1/holds/11111111-2222-3333-4444-555555555555", "").status());
+    assertThat(reply.status()).isNotEqualTo(405);
+  }
+
+  @Test
   void answersSeatTakenWithConflict() {
     assertThat(post("application/json", KEY, body("T-1000")).status()).isEqualTo(409);
   }
@@ -140,7 +177,7 @@ class HoldRoutesTest {
 
     assertThat(onHolds.status()).isEqualTo(405);
     assertThat(onHolds.header("Allow")).isEqualTo("POST");
-    assertThat(onHold.header("Allow")).isEqualTo("GET");
+    assertThat(onHold.header("Allow")).isEqualTo("GET, HEAD");
   }
 
   @Test

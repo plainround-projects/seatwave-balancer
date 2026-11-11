@@ -49,7 +49,12 @@ public final class SeatWaveServer {
   private static final int UNAVAILABLE = 503;
   // 0: the in-flight wait is the Lifecycle's job, done before the listeners are stopped.
   private static final int STOP_DELAY_SECONDS = 0;
-  private static final long WORKER_STOP_SECONDS = 5;
+  // After the drain, the longest wait for worker threads to end: a request past the drain
+  // deadline gets this long, then is interrupted. The worst-case stop is therefore the drain
+  // deadline plus this wait (ServiceSettingsTest checks compose.yaml's grace period covers it).
+  static final Duration WORKER_STOP_WAIT = Duration.ofSeconds(5);
+  // HEAD is answered like GET without a body (RFC 9110, Section 9.3.2); -1 tells the JDK server so.
+  private static final long NO_BODY = -1;
 
   private final HttpServer requests;
   private final HttpServer admin;
@@ -60,11 +65,17 @@ public final class SeatWaveServer {
   private final HoldRoutes routes;
   private final HoldStore store;
   private final String instanceName;
+  private final Duration workerStopWait;
 
   private SeatWaveServer(
-      ServiceSettings settings, String instanceName, HoldStore store, Clock clock)
+      ServiceSettings settings,
+      String instanceName,
+      HoldStore store,
+      Clock clock,
+      Duration workerStopWait)
       throws IOException {
     this.instanceName = instanceName;
+    this.workerStopWait = workerStopWait;
     this.store = store;
     this.routes = new HoldRoutes(store, new JsonCodec(), clock);
     AtomicInteger workerNumber = new AtomicInteger();
@@ -119,7 +130,34 @@ public final class SeatWaveServer {
     Objects.requireNonNull(instanceName, "instanceName");
     Objects.requireNonNull(store, "store");
     Objects.requireNonNull(clock, "clock");
-    return new SeatWaveServer(settings, instanceName, store, clock);
+    return new SeatWaveServer(settings, instanceName, store, clock, WORKER_STOP_WAIT);
+  }
+
+  /**
+   * Opens both listeners with another wait for the workers after the drain, so a test of the
+   * deadline does not wait the full {@link #WORKER_STOP_WAIT}.
+   *
+   * @param settings the checked settings
+   * @param instanceName the instance's name
+   * @param store the shared hold store
+   * @param clock the clock holds expire by
+   * @param workerStopWait the longest wait for worker threads after the drain
+   * @return the running server
+   * @throws IOException if a port cannot be bound
+   */
+  static SeatWaveServer start(
+      ServiceSettings settings,
+      String instanceName,
+      HoldStore store,
+      Clock clock,
+      Duration workerStopWait)
+      throws IOException {
+    Objects.requireNonNull(settings, "settings");
+    Objects.requireNonNull(instanceName, "instanceName");
+    Objects.requireNonNull(store, "store");
+    Objects.requireNonNull(clock, "clock");
+    Objects.requireNonNull(workerStopWait, "workerStopWait");
+    return new SeatWaveServer(settings, instanceName, store, clock, workerStopWait);
   }
 
   /**
@@ -155,7 +193,7 @@ public final class SeatWaveServer {
     adminThread.shutdownNow();
     workers.shutdown();
     try {
-      if (!workers.awaitTermination(WORKER_STOP_SECONDS, TimeUnit.SECONDS)) {
+      if (!workers.awaitTermination(workerStopWait.toNanos(), TimeUnit.NANOSECONDS)) {
         workers.shutdownNow();
       }
     } catch (InterruptedException interrupted) {
@@ -232,7 +270,8 @@ public final class SeatWaveServer {
   private void handleAdmin(HttpExchange exchange) throws IOException {
     try (exchange) {
       String path = exchange.getRequestURI().getRawPath();
-      boolean isGet = exchange.getRequestMethod().equals("GET");
+      String method = exchange.getRequestMethod();
+      boolean isGet = method.equals("GET") || method.equals("HEAD");
       Reply reply;
       if (isGet && path.equals("/health")) {
         // Liveness: the process answers. Never asks the database, because restarting an instance
@@ -248,7 +287,8 @@ public final class SeatWaveServer {
                 metrics.render().getBytes(StandardCharsets.UTF_8),
                 List.of());
       } else {
-        reply = Reply.json(NOT_FOUND, "{\"detail\":\"only GET /health, /ready and /metrics\"}");
+        reply =
+            Reply.json(NOT_FOUND, "{\"detail\":\"only GET or HEAD /health, /ready and /metrics\"}");
       }
       write(exchange, reply.withHeader("Cache-Control", "no-store"));
     }
@@ -297,10 +337,11 @@ public final class SeatWaveServer {
   }
 
   private static void drainBody(HttpExchange exchange) throws IOException {
-    // The request body is read and thrown away, so the 503 is not written while the client is
-    // still sending, which some clients report as a reset instead of a response.
+    // The request body is read and thrown away, up to one byte over the limit, so the 503 is not
+    // written while the client is still sending, which some clients report as a reset instead of
+    // a response. readNBytes reads until it has them or the body ends; a skip may stop short.
     try (InputStream in = exchange.getRequestBody()) {
-      in.skip(HoldRoutes.MAX_BODY_BYTES + 1L);
+      in.readNBytes(HoldRoutes.MAX_BODY_BYTES + 1);
     }
   }
 
@@ -313,6 +354,10 @@ public final class SeatWaveServer {
     // why a public balancer would remove it before the response leaves.
     exchange.getResponseHeaders().set("X-Served-By", instanceName);
     byte[] body = reply.body();
+    if (exchange.getRequestMethod().equals("HEAD")) {
+      exchange.sendResponseHeaders(reply.status(), NO_BODY);
+      return;
+    }
     exchange.sendResponseHeaders(reply.status(), body.length);
     try (OutputStream out = exchange.getResponseBody()) {
       out.write(body);

@@ -22,6 +22,8 @@ class LifecycleTest {
   private static final Duration LONG_WAIT = Duration.ofSeconds(10);
   private static final Duration SHORT_DEADLINE = Duration.ofMillis(50);
   private static final int RACERS = 8;
+  // Tries per racer after draining began, before the test lets the drain finish.
+  private static final long ATTEMPTS = 1_000;
 
   @Test
   void refusesEveryRequestWhileStarting() {
@@ -102,7 +104,11 @@ class LifecycleTest {
 
       running.close();
 
-      assertThat(drained.get(LONG_WAIT.toSeconds(), TimeUnit.SECONDS).inFlightLeft()).isZero();
+      // The last release wakes the drain: it ends at once, not when the 10 s deadline passes
+      // (a lost wake-up would still end "clean", only 10 s late).
+      Lifecycle.DrainResult result = drained.get(LONG_WAIT.toSeconds(), TimeUnit.SECONDS);
+      assertThat(result.inFlightLeft()).isZero();
+      assertThat(result.waited()).isLessThan(LONG_WAIT.dividedBy(2));
     }
   }
 
@@ -144,15 +150,18 @@ class LifecycleTest {
   void admitsNothingAfterDrainingStartsEvenUnderARace() throws Exception {
     Lifecycle lifecycle = new Lifecycle();
     lifecycle.markReady();
+    // Held open by the test, so the drain cannot end before the racers have tried many times.
+    Lifecycle.Admission held = lifecycle.tryAdmit().orElseThrow();
     AtomicBoolean drainingStarted = new AtomicBoolean();
+    AtomicLong attemptsAfterDrain = new AtomicLong();
     AtomicLong admittedAfterDrain = new AtomicLong();
-    CountDownLatch go = new CountDownLatch(1);
+    CountDownLatch racing = new CountDownLatch(RACERS);
     List<Future<?>> racers = new ArrayList<>();
-    try (ExecutorService threads = Executors.newFixedThreadPool(RACERS + 1)) {
+    try (ExecutorService threads = Executors.newFixedThreadPool(RACERS)) {
       for (int racer = 0; racer < RACERS; racer++) {
         racers.add(
             threads.submit(() -> {
-              go.await();
+              boolean isCounted = false;
               while (lifecycle.state() != LifecycleState.STOPPED) {
                 // Read the flag before asking: an admission granted after the flag was set means
                 // the gate let a request through after draining began.
@@ -164,13 +173,24 @@ class LifecycleTest {
                   }
                   admission.get().close();
                 }
+                if (wasDraining) {
+                  attemptsAfterDrain.incrementAndGet();
+                }
+                if (!isCounted) {
+                  // This racer is in its loop: the drain starts only when every racer is.
+                  isCounted = true;
+                  racing.countDown();
+                }
               }
               return null;
             }));
       }
-      go.countDown();
+      assertThat(racing.await(LONG_WAIT.toSeconds(), TimeUnit.SECONDS)).isTrue();
       lifecycle.startDraining();
       drainingStarted.set(true);
+      // The race is real: the racers keep asking while the instance drains.
+      await().atMost(LONG_WAIT).until(() -> attemptsAfterDrain.get() >= RACERS * ATTEMPTS);
+      held.close();
       Lifecycle.DrainResult result = lifecycle.awaitDrained(LONG_WAIT);
       for (Future<?> racerDone : racers) {
         racerDone.get(LONG_WAIT.toSeconds(), TimeUnit.SECONDS);

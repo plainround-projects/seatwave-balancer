@@ -19,8 +19,9 @@ import java.util.regex.Pattern;
  */
 public record NamedBalancer(String name, RuntimeApi api) {
 
+  // A port from 1 up, without a leading zero; the address is checked once it is parsed.
   private static final Pattern ENTRY =
-      Pattern.compile("([a-z][a-z0-9-]{0,31})=([0-9.]{7,15}):([0-9]{1,5})");
+      Pattern.compile("([a-z][a-z0-9-]{0,31})=([0-9.]{7,15}):([1-9][0-9]{0,4})");
   private static final int HIGHEST_PORT = 65_535;
 
   /** Checks the fields. */
@@ -51,6 +52,12 @@ public record NamedBalancer(String name, RuntimeApi api) {
         address = InetAddress.ofLiteral(matcher.group(2));
       } catch (IllegalArgumentException notAnAddress) {
         return Result.error("'" + entry + "' does not hold an IP address");
+      }
+      // ofLiteral also reads short and padded forms (127.0.1, 010.0.0.1); only the dotted form
+      // that prints back the same is the address the reader meant.
+      if (!address.getHostAddress().equals(matcher.group(2))) {
+        return Result.error(
+            "'" + entry + "' does not hold a dotted IPv4 address with four parts and no padding");
       }
       balancers.add(
           new NamedBalancer(

@@ -27,7 +27,7 @@ class SeatWaveCliTest {
         start("config/seatwave-container.properties", "Seat Wave");
 
     assertThat(running).isEmpty();
-    assertThat(text(err)).contains("usage: serve");
+    assertThat(text(err)).contains("usage: SeatWaveCli");
   }
 
   @Test

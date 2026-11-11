@@ -1,6 +1,7 @@
 package io.plainround.seatwave.balancer.config;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import com.github.sviperll.result4j.Result;
 import java.io.ByteArrayOutputStream;
@@ -61,6 +62,25 @@ class SettingsFilesTest {
             new PrintStream(err, true, StandardCharsets.UTF_8));
 
     assertThat(loaded).isEmpty();
-    assertThat(err.toString(StandardCharsets.UTF_8)).contains("escape.properties cannot be read");
+    assertThat(err.toString(StandardCharsets.UTF_8))
+        .contains("escape.properties is not a valid properties file");
+  }
+
+  @Test
+  void letsABugInTheReadingFunctionThrough() throws Exception {
+    Path file =
+        Files.writeString(folder.resolve("good.properties"), "a=1\n", StandardCharsets.UTF_8);
+    ByteArrayOutputStream err = new ByteArrayOutputStream();
+
+    assertThatThrownBy(() ->
+            SettingsFiles.load(
+                file,
+                reader -> {
+                  throw new IllegalArgumentException("a bug in the settings record");
+                },
+                new PrintStream(err, true, StandardCharsets.UTF_8)))
+        .isInstanceOf(IllegalArgumentException.class)
+        .hasMessage("a bug in the settings record");
+    assertThat(err.toString(StandardCharsets.UTF_8)).isEmpty();
   }
 }
